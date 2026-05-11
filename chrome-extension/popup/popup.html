@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Product Importer</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      width: 320px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #fff;
+      color: #1a1a1a;
+      font-size: 13px;
+    }
+    .header {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: #fff;
+      padding: 14px 16px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .header .logo { font-size: 20px; }
+    .header h1 { font-size: 15px; font-weight: 600; }
+    .content { padding: 12px 16px; }
+    .platform-badge {
+      display: inline-block;
+      padding: 3px 10px;
+      border-radius: 10px;
+      font-size: 11px;
+      font-weight: 600;
+      margin-bottom: 10px;
+    }
+    .badge-taobao { background: #ff5000; color: #fff; }
+    .badge-tmall { background: #c00; color: #fff; }
+    .badge-alibaba { background: #ff6a00; color: #fff; }
+    .badge-xiaohongshu { background: #fe2c55; color: #fff; }
+    .badge-unknown { background: #e0e0e0; color: #666; }
+
+    .product-preview {
+      background: #f8f9fa;
+      border-radius: 8px;
+      padding: 10px;
+      margin: 10px 0;
+      max-height: 120px;
+      overflow: hidden;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .product-preview .title { font-weight: 600; color: #333; }
+    .product-preview .price { color: #ff5000; font-size: 16px; font-weight: 700; }
+    .product-preview .meta { color: #888; margin-top: 4px; }
+
+    .btn {
+      display: block;
+      width: 100%;
+      padding: 10px;
+      border: none;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn-import {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: #fff;
+      margin-top: 8px;
+    }
+    .btn-import:hover { opacity: 0.9; transform: translateY(-1px); }
+    .btn-import:disabled {
+      background: #ccc;
+      cursor: not-allowed;
+      transform: none;
+    }
+    .btn-secondary {
+      background: #f0f0f0;
+      color: #555;
+      margin-top: 6px;
+      font-size: 12px;
+    }
+    .btn-secondary:hover { background: #e0e0e0; }
+
+    .status {
+      padding: 8px 12px;
+      border-radius: 6px;
+      margin: 8px 0;
+      font-size: 12px;
+      text-align: center;
+    }
+    .status-success { background: #e8f5e9; color: #2e7d32; }
+    .status-error { background: #ffebee; color: #c62828; }
+    .status-loading { background: #e3f2fd; color: #1565c0; }
+    .status-info { background: #fff3e0; color: #e65100; }
+
+    .settings-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px solid #eee;
+    }
+    .settings-row label { font-size: 11px; color: #888; white-space: nowrap; }
+    .settings-row input {
+      flex: 1;
+      padding: 4px 8px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      font-size: 11px;
+    }
+    .hidden { display: none !important; }
+    .spinner {
+      display: inline-block;
+      width: 14px; height: 14px;
+      border: 2px solid #fff;
+      border-top-color: transparent;
+      border-radius: 50%;
+      animation: spin 0.6s linear infinite;
+      margin-right: 6px;
+      vertical-align: middle;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .score-bar {
+      height: 4px;
+      border-radius: 2px;
+      margin-top: 6px;
+      background: #e0e0e0;
+    }
+    .score-fill {
+      height: 100%;
+      border-radius: 2px;
+      transition: width 0.5s;
+    }
+    .score-high { background: #4caf50; }
+    .score-mid { background: #ff9800; }
+    .score-low { background: #f44336; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <span class="logo">&#x1F4E6;</span>
+    <h1>Product Importer</h1>
+  </div>
+
+  <div class="content">
+    <!-- Not on product page -->
+    <div id="state-no-product" class="hidden">
+      <div class="status status-info">
+        Open a product page on Taobao / 1688 / Xiaohongshu to import
+      </div>
+    </div>
+
+    <!-- Product detected -->
+    <div id="state-ready" class="hidden">
+      <div id="badge"></div>
+      <div class="product-preview" id="preview"></div>
+      <button class="btn btn-import" id="btn-import">
+        &#x2B07; Import This Product
+      </button>
+    </div>
+
+    <!-- Importing... -->
+    <div id="state-importing" class="hidden">
+      <div class="status status-loading">
+        <span class="spinner"></span> Importing product...
+      </div>
+    </div>
+
+    <!-- Import result -->
+    <div id="state-result" class="hidden">
+      <div id="result-status" class="status"></div>
+      <div class="product-preview" id="result-preview"></div>
+      <button class="btn btn-secondary" id="btn-reset">
+        &#x2190; Import Another
+      </button>
+      <button class="btn btn-secondary" id="btn-dashboard" style="display:none;">
+        &#x1F4CA; Open Dashboard
+      </button>
+    </div>
+
+    <!-- Server offline -->
+    <div id="state-offline" class="hidden">
+      <div class="status status-error">
+        Backend server not running.<br>
+        Run: <code>python run.py api</code>
+      </div>
+      <button class="btn btn-secondary" id="btn-retry">&#x21BB; Retry</button>
+    </div>
+
+    <!-- Settings -->
+    <div class="settings-row">
+      <label>API:</label>
+      <input type="text" id="api-url" value="http://localhost:8765" placeholder="http://localhost:8765">
+      <button class="btn btn-secondary" id="btn-save-api" style="width:auto; margin:0; padding:5px 10px; font-size:11px;">
+        Save
+      </button>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

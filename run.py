@@ -416,6 +416,18 @@ def export():
 
 
 @cli.command()
+@click.option("--host", default="127.0.0.1", help="API server host")
+@click.option("--port", default=8765, help="API server port")
+def api(host: str, port: int):
+    """Start API server for Chrome extension integration."""
+    from src.api.server import run
+
+    click.echo(f"Starting API server on http://{host}:{port}")
+    click.echo("Chrome extension will connect to this endpoint.")
+    run(host=host, port=port)
+
+
+@cli.command()
 def status():
     """Show pipeline status summary."""
     from src.db.repository import ProductRepository

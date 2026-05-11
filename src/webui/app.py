@@ -58,6 +58,12 @@ async def load_products(status: PipelineStatus):
     return await get_repo().list_by_status(status)
 
 
+def _process_single_image(api_client: ImageAPIClient, image_path: Path, prompt: str) -> tuple[str, bytes]:
+    """Process one image and return (filename, data). Raises on failure."""
+    data = _run_async(api_client.process(image_path, prompt=prompt))
+    return image_path.name, data
+
+
 def _get_all_image_paths(product: Product) -> list[tuple[str, Path]]:
     """Collect all local image paths. Returns [(label, path)]."""
     results: list[tuple[str, Path]] = []
@@ -433,9 +439,9 @@ for idx, product in enumerate(products):
                     st.session_state[f"{PP}_step"] = "text"
                     st.rerun()
             else:
-                # ── 1A: Image Selection & Renaming ──
-                st.markdown('<span class="section-title">📷 Select & Rename Images</span>', unsafe_allow_html=True)
-                st.caption(f"{len(image_paths)} images available — check to select, edit names below")
+                # ── Image cards (per-image: input↔output + prompt + retry) ──
+                st.markdown('<span class="section-title">📷 Image Processing Cards</span>', unsafe_allow_html=True)
+                st.caption("Each image has its own prompt. Process individually or batch all.")
 
                 select_all = st.checkbox("Select All", value=True, key=f"{PP}_all")
                 cur_sel = st.session_state[f"{PP}_selected"]
@@ -448,160 +454,170 @@ for idx, product in enumerate(products):
                 for i, (label, path) in enumerate(image_paths):
                     if not path.exists():
                         continue
-                    webp = st.session_state[f"{PP}_webp"]
-                    proc = st.session_state[f"{PP}_processed"]
+                    proc_data = st.session_state[f"{PP}_processed"].get(i)
+                    webp_data = st.session_state[f"{PP}_webp"].get(i)
+                    names = st.session_state[f"{PP}_names"]
                     prompts = st.session_state[f"{PP}_img_prompts"]
 
-                    with st.container(border=True):
-                        c_chk, c_img, c_info = st.columns([0.2, 1.5, 3], gap="small")
-                        with c_chk:
-                            st.markdown("<br>" * 5, unsafe_allow_html=True)
+                    st.markdown("---")
+                    with st.container():
+                        # ── Row 1: checkbox + name + batch-select ──
+                        r1c1, r1c2 = st.columns([0.1, 5], gap="small")
+                        with r1c1:
+                            st.markdown("<br>", unsafe_allow_html=True)
                             sel = st.checkbox("✓", value=i in cur_sel, key=f"{PP}_sel_{i}", label_visibility="visible")
                             if sel:
                                 cur_sel.add(i)
                             else:
                                 cur_sel.discard(i)
-                            if i in webp:
-                                st.success("WebP")
-                            elif i in proc:
-                                st.info("Done")
-                            else:
-                                st.caption(path.suffix)
-                        with c_img:
-                            st.image(str(path), width="stretch")
-                        with c_info:
-                            names = st.session_state[f"{PP}_names"]
-                            current = names.get(i, "")
-                            new_name = st.text_input("Image Name", value=current, key=f"{PP}_nm_{i}", placeholder="e.g. product_main_01")
-                            names[i] = new_name.strip() or current
+                        with r1c2:
+                            current_name = names.get(i, "")
+                            new_name = st.text_input(
+                                "Image Name", value=current_name,
+                                key=f"{PP}_nm_{i}", placeholder="e.g. product_main_01",
+                                label_visibility="visible",
+                            )
+                            names[i] = new_name.strip() or current_name
                             st.session_state[f"{PP}_names"] = names
+
+                        # ── Row 2: Input ↔ Output side by side ──
+                        i_col, arrow_col, o_col = st.columns([2, 0.15, 2], gap="small")
+                        with i_col:
+                            st.caption("📥 Original")
+                            st.image(str(path), width="stretch")
+                            st.caption(f"{path.suffix} | {path.stat().st_size // 1024}KB")
+                        with arrow_col:
+                            st.markdown(
+                                "<div style='text-align:center;padding-top:60px;font-size:28px;color:#ff5000;'>→</div>",
+                                unsafe_allow_html=True,
+                            )
+                        with o_col:
+                            st.caption("📤 Processed")
+                            if proc_data:
+                                st.image(proc_data, width="stretch")
+                                if webp_data:
+                                    st.success("✅ WebP ready")
+                                else:
+                                    st.info("⚙️ Processed")
+                            else:
+                                st.markdown(
+                                    "<div style='border:2px dashed #ddd;border-radius:8px;height:120px;"
+                                    "display:flex;align-items:center;justify-content:center;color:#bbb;'>"
+                                    "Waiting...</div>",
+                                    unsafe_allow_html=True,
+                                )
+                                st.caption("Not processed")
+
+                        # ── Row 3: Prompt + action buttons ──
+                        st.caption("📝 Prompt")
+                        pc1, pc2 = st.columns([4, 1], gap="small")
+                        with pc1:
                             current_prompt = prompts.get(i, "")
                             new_prompt = st.text_area(
-                                "Processing Prompt",
+                                "Prompt",
                                 value=current_prompt,
                                 height=68,
                                 key=f"{PP}_prompt_{i}",
                                 placeholder="Describe how to process this image...",
+                                label_visibility="collapsed",
                             )
                             prompts[i] = new_prompt
                             st.session_state[f"{PP}_img_prompts"] = prompts
+                        with pc2:
+                            st.markdown("<br>" * 1, unsafe_allow_html=True)
+                            api_client_i = ImageAPIClient()
+                            if st.button("🔄 Retry", key=f"{PP}_retry_{i}", type="secondary", disabled=not api_client_i.configured):
+                                with st.spinner(f"Reprocessing {path.name}..."):
+                                    try:
+                                        _, retry_data = _process_single_image(api_client_i, path, new_prompt)
+                                        st.session_state[f"{PP}_processed"][i] = retry_data
+                                        if i in st.session_state[f"{PP}_webp"]:
+                                            del st.session_state[f"{PP}_webp"][i]
+                                    except Exception as exc:
+                                        st.error(f"Failed: {exc}")
+                                st.rerun()
 
-                # Bulk rename
-                c_bulk1, c_bulk2 = st.columns([3, 1], gap="small")
-                with c_bulk1:
-                    bulk_prefix = st.text_input("Bulk rename prefix", value=handle, key=f"{PP}_prefix")
-                with c_bulk2:
-                    st.markdown("<br>", unsafe_allow_html=True)
-                    if st.button("📝 Apply Prefix", key=f"{PP}_apply"):
-                        names = st.session_state[f"{PP}_names"]
-                        for i in sorted(cur_sel):
-                            names[i] = f"{bulk_prefix}_{i+1:02d}"
-                        st.session_state[f"{PP}_names"] = names
-                        st.rerun()
+                            if proc_data and not webp_data:
+                                if st.button("💾 WebP", key=f"{PP}_webp_single_{i}"):
+                                    from PIL import Image
+                                    try:
+                                        img = Image.open(io.BytesIO(proc_data))
+                                        img = img.convert("RGBA") if img.mode in ("RGBA","P","LA") else img.convert("RGB")
+                                        buf = io.BytesIO()
+                                        img.save(buf, "WEBP", quality=85, method=6)
+                                        st.session_state[f"{PP}_webp"][i] = buf.getvalue()
+                                    except Exception as exc:
+                                        st.error(f"WebP failed: {exc}")
+                                    st.rerun()
 
-                # ── 1B: Send to Image API ──
+                            if webp_data:
+                                name = names.get(i, f"img_{i}")
+                                st.download_button(
+                                    f"⬇ {name}.webp", data=webp_data, file_name=f"{name}.webp",
+                                    mime="image/webp", key=f"{PP}_dl_{i}",
+                                )
+
+                # ── Batch Operations ──
                 st.markdown("---")
-                st.markdown('<span class="section-title">🚀 Process Images</span>', unsafe_allow_html=True)
+                st.markdown('<span class="section-title">🚀 Batch Operations</span>', unsafe_allow_html=True)
 
                 selected_list = sorted(cur_sel)
                 api_client = ImageAPIClient()
                 api_ready = api_client.configured
 
+                with st.expander("🔧 API Config Debug", expanded=not api_ready):
+                    st.caption(f"base_url: `{api_client.base_url or '(empty)'}`")
+                    st.caption(f"configured: {api_client.configured}")
+                    st.caption(f"is_gemini: {api_client._is_gemini}")
+
                 if not selected_list:
                     st.warning("No images selected")
                 else:
-                    st.caption(f"{len(selected_list)} image(s) selected for processing")
-
-                # Diagnostics
-                with st.expander("🔧 API Config Debug", expanded=not api_ready):
-                    st.caption(f"base_url: `{api_client.base_url or '(empty)'}`")
-                    st.caption(f"api_key: `{'***' + api_client.api_key[-4:] if api_client.api_key and len(api_client.api_key) > 4 else '(not set)'}`")
-                    st.caption(f"is_gemini: {api_client._is_gemini}")
-                    st.caption(f"model: {api_client.model}")
-                    st.caption(f"configured: {api_client.configured}")
-
-                c_api1, c_api2 = st.columns([2, 1], gap="medium")
-                with c_api1:
-                    if st.button("🚀 Send to Image API", key=f"{PP}_api", type="primary", disabled=not (api_ready and selected_list)):
-                        with st.spinner(f"Processing {len(selected_list)} images..."):
-                            prompts = st.session_state[f"{PP}_img_prompts"]
-                            for idx in selected_list:
-                                try:
-                                    img_prompt = prompts.get(idx, "")
-                                    data = _run_async(api_client.process(image_paths[idx][1], prompt=img_prompt))
-                                    st.session_state[f"{PP}_processed"][idx] = data
-                                except Exception as exc:
-                                    st.error(f"Failed {image_paths[idx][1].name}: {exc}")
-                        st.rerun()
-                with c_api2:
-                    if not api_ready:
-                        st.caption("⚠️ IMAGE_API_BASE_URL is empty — set it in .env then restart")
-
-                # ── 1C: Processed Preview ──
-                processed = st.session_state[f"{PP}_processed"]
-                if processed:
-                    st.markdown("---")
-                    st.markdown('<span class="section-title">👁 Preview Processed Images</span>', unsafe_allow_html=True)
-                    st.caption(f"{len(processed)} image(s) processed")
-                    pcols = st.columns(min(len(processed), 4))
-                    for pi, (idx, data) in enumerate(processed.items()):
-                        col_idx = pi % 4
-                        if col_idx < len(pcols):
-                            with pcols[col_idx]:
-                                name = st.session_state[f"{PP}_names"].get(idx, f"img_{idx}")
-                                st.caption(name)
-                                st.image(data, width="stretch")
-
-                    # ── 1D: WebP Convert ──
-                    st.markdown("---")
-                    st.markdown('<span class="section-title">🔄 Convert to WebP</span>', unsafe_allow_html=True)
-                    st.caption("Convert all processed images to WebP format for Shopify")
-
-                    if st.button("🔄 Convert All to WebP", key=f"{PP}_webp_btn", type="primary"):
-                        with st.spinner("Converting to WebP..."):
+                    st.caption(f"{len(selected_list)} image(s) selected")
+                    bc1, bc2, bc3 = st.columns([1.5, 1, 1], gap="small")
+                    with bc1:
+                        if st.button("🚀 Process All Selected", key=f"{PP}_api", type="primary", disabled=not (api_ready and selected_list)):
+                            with st.spinner(f"Processing {len(selected_list)}..."):
+                                prompts = st.session_state[f"{PP}_img_prompts"]
+                                for idx in selected_list:
+                                    try:
+                                        img_prompt = prompts.get(idx, "")
+                                        _, data = _process_single_image(api_client, image_paths[idx][1], img_prompt)
+                                        st.session_state[f"{PP}_processed"][idx] = data
+                                    except Exception as exc:
+                                        st.error(f"Failed {image_paths[idx][1].name}: {exc}")
+                            st.rerun()
+                    with bc2:
+                        processed = st.session_state[f"{PP}_processed"]
+                        proc_sel = [idx for idx in selected_list if idx in processed]
+                        if st.button("🔄 Convert All to WebP", key=f"{PP}_webp_btn", type="secondary", disabled=not proc_sel):
                             from PIL import Image
-                            for idx, data in processed.items():
-                                try:
-                                    img = Image.open(io.BytesIO(data))
-                                    img = img.convert("RGBA") if img.mode in ("RGBA","P","LA") else img.convert("RGB")
-                                    buf = io.BytesIO()
-                                    img.save(buf, "WEBP", quality=85, method=6)
-                                    st.session_state[f"{PP}_webp"][idx] = buf.getvalue()
-                                except Exception as exc:
-                                    st.error(f"WebP failed {idx}: {exc}")
-                        st.rerun()
+                            with st.spinner(f"Converting {len(proc_sel)}..."):
+                                for idx in proc_sel:
+                                    try:
+                                        img = Image.open(io.BytesIO(processed[idx]))
+                                        img = img.convert("RGBA") if img.mode in ("RGBA","P","LA") else img.convert("RGB")
+                                        buf = io.BytesIO()
+                                        img.save(buf, "WEBP", quality=85, method=6)
+                                        st.session_state[f"{PP}_webp"][idx] = buf.getvalue()
+                                    except Exception as exc:
+                                        st.error(f"WebP failed {idx}: {exc}")
+                            st.rerun()
+                    with bc3:
+                        if not api_ready:
+                            st.caption("⚠️ Set IMAGE_API_BASE_URL in .env")
 
-                # ── 1E: Download WebP ──
-                webp_data = st.session_state[f"{PP}_webp"]
-                if webp_data:
-                    st.markdown("---")
-                    st.markdown('<span class="section-title">⬇ Download WebP Images</span>', unsafe_allow_html=True)
-                    st.success(f"✅ {len(webp_data)} WebP image(s) ready for download")
-                    wcols = st.columns(min(len(webp_data), 3))
-                    for wi, (idx, data) in enumerate(webp_data.items()):
-                        col_idx = wi % 3
-                        if col_idx < len(wcols):
-                            with wcols[col_idx]:
-                                name = st.session_state[f"{PP}_names"].get(idx, f"img_{idx}")
-                                st.download_button(
-                                    f"⬇ {name}.webp", data=data, file_name=f"{name}.webp",
-                                    mime="image/webp", key=f"{PP}_dl_{idx}",
-                                )
-
-                # ── 1F: Navigate to Text Processing ──
+                # ── Navigate to Text Processing ──
                 st.markdown("---")
-                st.markdown('<span class="section-title">➡ Next: Text Processing</span>', unsafe_allow_html=True)
-                st.caption("Once images are processed, proceed to text processing for metafields and Excel export.")
-
-                webp_ready = bool(st.session_state.get(f"{PP}_webp"))
-                c_next1, c_next2 = st.columns([1, 1], gap="medium")
-                with c_next1:
+                cn1, cn2 = st.columns([1, 1], gap="medium")
+                with cn1:
                     if st.button("📄 Proceed to Text Processing →", key=f"{PP}_to_text", type="primary"):
                         st.session_state[f"{PP}_step"] = "text"
                         st.rerun()
-                with c_next2:
+                with cn2:
+                    webp_ready = bool(st.session_state.get(f"{PP}_webp"))
                     if not webp_ready:
-                        st.caption("💡 Tip: Convert images to WebP first for a complete Excel export.")
+                        st.caption("💡 Tip: Process images to WebP first for a complete Excel export.")
 
         # ═══════════════════════════════════════════════════════
         #  STEP 2: TEXT PROCESSING
