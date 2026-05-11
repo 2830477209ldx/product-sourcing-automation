@@ -1,0 +1,43 @@
+[project]
+name = "product-sourcing-automation"
+version = "0.1.0"
+description = "AI-driven cross-border product sourcing pipeline: scrape CN platforms, analyze US market potential, publish to Shopify"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Product Sourcing Team" }]
+
+dependencies = [
+    "aiosqlite>=0.21.0",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=5.3.0",
+    "browser-use>=0.12.0",
+    "rapidocr-onnxruntime>=1.4.0",
+    "streamlit>=1.40.0",
+    "ShopifyAPI>=12.7.0",
+    "openai>=2.16.0",
+    "httpx>=0.28.0",
+    "playwright>=1.52.0",
+    "pydantic>=2.10.0",
+    "pyyaml>=6.0.0",
+    "pillow>=11.0.0",
+    "loguru>=0.7.0",
+    "python-dotenv>=1.0.0",
+    "click>=8.0.0",
+    "opencv-python>=4.10.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.25.0",
+    "ruff>=0.9.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

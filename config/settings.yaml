@@ -1,0 +1,36 @@
+# Product Sourcing Automation — Configuration
+
+# ── AI / LLM ──────────────────────────────────────────
+ai:
+  provider: deepseek
+  api_key: "${DEEPSEEK_API_KEY}"
+  base_url: "https://api.deepseek.com"
+  model_vision: "deepseek-chat"
+  model_text: "deepseek-chat"
+  temperature: 0.3
+
+# ── Market Analysis ───────────────────────────────────
+market_judge:
+  threshold: 60
+  dimensions:
+    visual_appeal: 25
+    category_demand: 25
+    uniqueness: 20
+    price_arbitrage: 15
+    trend_alignment: 15
+
+# ── Currency ──────────────────────────────────────────
+currency:
+  cny_to_usd: 7.2
+
+# ── Paths ────────────────────────────────────────────
+paths:
+  data_images: "data/images"
+  data_exports: "data/exports"
+  db: "data/products.db"
+
+# ── Logging ──────────────────────────────────────────
+logging:
+  level: "DEBUG"
+  format: "{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}"
+  rotation: "10 MB"
