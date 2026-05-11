@@ -2,11 +2,12 @@
 
 # ── AI / LLM ──────────────────────────────────────────
 ai:
-  provider: deepseek
-  api_key: "${DEEPSEEK_API_KEY}"
-  base_url: "https://api.deepseek.com"
-  model_vision: "deepseek-chat"
-  model_text: "deepseek-chat"
+  # Choose provider: deepseek | gemini
+  provider: gemini
+  api_key: "${GEMINI_API_KEY}"
+  base_url: "https://generativelanguage.googleapis.com/v1beta/openai/"
+  model_text: "gemini-2.5-flash"
+  model_vision: "gemini-2.5-flash"
   temperature: 0.3
 
 # ── Market Analysis ───────────────────────────────────
@@ -34,3 +35,9 @@ logging:
   level: "DEBUG"
   format: "{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}"
   rotation: "10 MB"
+
+# ── Image Processing API ──────────────────────────────
+image_api:
+  base_url: "${IMAGE_API_BASE_URL}"
+  api_key: "${IMAGE_API_KEY}"
+  model: "gemini-2.5-flash"

@@ -11,7 +11,7 @@ from loguru import logger
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-load_dotenv(PROJECT_ROOT / ".env")
+load_dotenv(PROJECT_ROOT / ".env", override=True)
 
 
 def _env_replace(value: str) -> str:
@@ -96,6 +96,10 @@ class Config:
     @property
     def currency(self) -> dict[str, Any]:
         return self._data.get("currency", {"cny_to_usd": 7.2})
+
+    @property
+    def image_api(self) -> dict[str, Any]:
+        return self._data.get("image_api", {})
 
 
 def _deep_merge(base: dict, overlay: dict) -> None:

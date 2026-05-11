@@ -161,6 +161,7 @@ def _make_pipeline(headless: bool = True):
         model_text=cfg.ai.get("model_text", "deepseek-chat"),
         model_vision=cfg.ai.get("model_vision", "deepseek-chat"),
         temperature=cfg.ai.get("temperature", 0.3),
+        provider=cfg.ai.get("provider", "deepseek"),
     )
     return Pipeline(llm=llm, threshold=cfg.market_judge.get("threshold", 60), headless=headless)
 
@@ -256,6 +257,9 @@ def add_interactive(url: str):
             api_key=cfg.ai["api_key"],
             base_url=cfg.ai.get("base_url", ""),
             model_text=cfg.ai.get("model_text", "deepseek-chat"),
+            model_vision=cfg.ai.get("model_vision", "deepseek-chat"),
+            temperature=cfg.ai.get("temperature", 0.3),
+            provider=cfg.ai.get("provider", "deepseek"),
         )
 
         from src.pipeline.stages import ExtractStage, AnalyzeStage
@@ -352,6 +356,9 @@ def batch_add_interactive(url: tuple, file: str):
                 api_key=cfg.ai["api_key"],
                 base_url=cfg.ai.get("base_url", ""),
                 model_text=cfg.ai.get("model_text", "deepseek-chat"),
+                model_vision=cfg.ai.get("model_vision", "deepseek-chat"),
+                temperature=cfg.ai.get("temperature", 0.3),
+                provider=cfg.ai.get("provider", "deepseek"),
             )
             from src.pipeline.stages import ExtractStage, AnalyzeStage
 

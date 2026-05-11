@@ -1,4 +1,9 @@
-"""Unified LLM service — single async OpenAI client, shared by all modules."""
+"""Unified LLM service — single async OpenAI client, shared by all modules.
+
+Supports:
+  - DeepSeek: https://api.deepseek.com (auth via Authorization header)
+  - Gemini:  https://generativelanguage.googleapis.com/v1beta/openai/ (api_key as query param)
+"""
 
 from __future__ import annotations
 
@@ -23,14 +28,31 @@ class LLMService:
         model_text: str = "deepseek-chat",
         model_vision: str = "deepseek-chat",
         temperature: float = 0.3,
+        provider: str = "deepseek",
     ) -> None:
-        self._client = AsyncOpenAI(
-            api_key=api_key,
-            base_url=base_url or None,
-        )
+        self.provider = provider
         self.model_text = model_text
         self.model_vision = model_vision
         self.temperature = temperature
+
+        if provider == "gemini":
+            from openai import DefaultHttpxClient
+            import httpx
+            httpx_client = DefaultHttpxClient(
+                transport=httpx.HTTPTransport(
+                    headers={"x-goog-api-key": api_key},
+                )
+            )
+            self._client = AsyncOpenAI(
+                api_key="dummy",
+                base_url=base_url,
+                http_client=httpx_client,
+            )
+        else:
+            self._client = AsyncOpenAI(
+                api_key=api_key,
+                base_url=base_url or None,
+            )
 
     # ── Core call ────────────────────────────────────────────
 

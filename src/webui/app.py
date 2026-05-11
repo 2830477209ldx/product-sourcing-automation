@@ -1,8 +1,9 @@
-"""Streamlit dashboard — review and approve products. Tmall-inspired layout."""
+"""Streamlit dashboard — review, approve, process images + text, export."""
 
 from __future__ import annotations
 
 import asyncio
+import io
 import re
 import sys
 from pathlib import Path
@@ -11,10 +12,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import streamlit as st
 
+from src.config import config
 from src.db.repository import ProductRepository
-from src.models.product import PipelineStatus
+from src.llm.service import LLMService
+from src.models.product import PipelineStatus, Product
+from src.processing.image_api import ImageAPIClient
+from src.webui.excel_exporter import export_products_to_xlsx
 
 IMAGE_DIR = Path("data/images")
+
+METAFIELDS_GEN_PROMPT = """You are a Shopify content writer. Generate 4 metafield sections for this product in English.
+
+Product Title: {title_en}
+Description: {description_en}
+Tags: {tags}
+
+Generate:
+1. custom.description (rich_text): Full formatted product description (HTML: <p>, <ul>, <li>).
+2. custom.inspiration: Brand story / lifestyle paragraph.
+3. custom.highlights: 3-5 bullet points (use * prefix) of key selling points.
+4. custom.notices: Care instructions, safety warnings (use * prefix).
+
+Return ONLY JSON:
+{{"description": "...", "inspiration": "...", "highlights": "...", "notices": "..."}}"""
 
 
 def _run_async(coro):
@@ -24,7 +44,6 @@ def _run_async(coro):
         loop = None
     if loop and loop.is_running():
         import concurrent.futures
-
         with concurrent.futures.ThreadPoolExecutor() as pool:
             return pool.submit(asyncio.run, coro).result()
     return asyncio.run(coro)
@@ -36,75 +55,96 @@ def get_repo():
 
 
 async def load_products(status: PipelineStatus):
-    repo = get_repo()
-    return await repo.list_by_status(status)
+    return await get_repo().list_by_status(status)
+
+
+def _get_all_image_paths(product: Product) -> list[tuple[str, Path]]:
+    """Collect all local image paths. Returns [(label, path)]."""
+    results: list[tuple[str, Path]] = []
+    seen: set[Path] = set()
+    for p in product.images:
+        pp = Path(p)
+        if pp.exists() and pp not in seen:
+            seen.add(pp)
+            results.append((f"main_{pp.stem}", pp))
+    for p in product.desc_images:
+        pp = Path(p)
+        if pp.exists() and pp not in seen:
+            seen.add(pp)
+            results.append((f"desc_{pp.stem}", pp))
+    skus = product.sku_prices if isinstance(product.sku_prices, list) else []
+    for sku in skus:
+        for img_url in sku.get("images", []):
+            pp = Path(str(img_url))
+            if pp.exists() and pp not in seen:
+                seen.add(pp)
+                results.append((f"sku_{sku.get('name','')[:20]}_{pp.stem}", pp))
+    return results
+
+
+async def _generate_metafields(product: Product) -> dict[str, str]:
+    cfg = config.ai
+    llm = LLMService(
+        api_key=cfg["api_key"],
+        base_url=cfg.get("base_url", ""),
+        model_text=cfg.get("model_text", "deepseek-chat"),
+        temperature=0.3,
+    )
+    prompt = METAFIELDS_GEN_PROMPT.format(
+        title_en=product.title_en or product.title_cn,
+        description_en=product.description_en or product.description_cn[:1000],
+        tags=", ".join(product.tags) if product.tags else "",
+    )
+    result = await llm.chat_json([{"role": "user", "content": prompt}], max_tokens=2000)
+    if result.get("_parse_error"):
+        return {}
+    return {
+        "description": result.get("description", ""),
+        "inspiration": result.get("inspiration", ""),
+        "highlights": result.get("highlights", ""),
+        "notices": result.get("notices", ""),
+    }
 
 
 # ── Page config ──────────────────────────────────────────────
 st.set_page_config(page_title="Product Sourcing — Review", page_icon="🛒", layout="wide")
 
-# ── Custom CSS ───────────────────────────────────────────────
 st.markdown("""
 <style>
-    /* ── Image containers ── */
-    .stImage {
-        border-radius: 8px;
-        overflow: hidden;
-    }
-    .stImage img {
-        border-radius: 8px;
-        border: 1px solid #e8e8e8;
-        object-fit: cover;
-    }
-    /* ── Thumbnail strip ── */
-    .thumb-wrap {
-        position: relative;
-        border-radius: 6px;
-        overflow: hidden;
-        cursor: pointer;
-        transition: all 0.15s;
-    }
-    .thumb-wrap:hover { opacity: 0.85; }
-    .thumb-wrap.active { box-shadow: 0 0 0 2px #ff5000; }
-    /* ── Price ── */
+    .stImage { border-radius: 8px; overflow: hidden; }
+    .stImage img { border-radius: 8px; border: 1px solid #e8e8e8; object-fit: cover; }
     .price-current { font-size: 28px; font-weight: 700; color: #ff5000; }
     .price-original { font-size: 14px; color: #999; text-decoration: line-through; margin-left: 8px; }
     .price-usd { font-size: 20px; font-weight: 600; color: #333; margin-top: 4px; }
-    /* ── Score card ── */
     .score-card {
         text-align: center; padding: 12px 8px; border-radius: 10px;
         border: 2px solid #e8e8e8; background: #fff;
     }
-    /* ── SKU grid ── */
     .sku-card {
         border: 1px solid #e8e8e8; border-radius: 8px; padding: 6px;
-        text-align: center; background: #fafafa; transition: border-color 0.15s;
+        text-align: center; background: #fafafa;
     }
-    .sku-card:hover { border-color: #ff5000; }
     .sku-name { font-size: 11px; color: #666; margin-top: 4px; line-height: 1.3; word-break: break-all; }
     .sku-price-tag { font-size: 13px; font-weight: 600; color: #ff5000; }
-    /* ── Section titles ── */
     .section-title {
         font-size: 15px; font-weight: 600; margin-bottom: 10px;
         padding-bottom: 4px; border-bottom: 2px solid #ff5000; display: inline-block;
     }
-    /* ── Tags ── */
     .tag-pill {
         display: inline-block; background: #fff0f0; color: #ff5000;
         padding: 2px 10px; border-radius: 12px; font-size: 12px;
         margin: 2px; border: 1px solid #ffd4c4;
     }
-    /* ── Progress bar labels ── */
     .bar-label { font-size: 12px; color: #555; white-space: nowrap; }
-    /* ── Expanders ── */
     div[data-testid="stExpander"] {
         border: 1px solid #e8e8e8 !important; border-radius: 10px !important;
         margin-bottom: 14px !important;
     }
-    /* ── Reduce column gaps ── */
     div[data-testid="column"] { padding-left: 6px; padding-right: 6px; }
-    div[data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlock"] {
-        gap: 0.4rem;
+    div[data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlock"] { gap: 0.4rem; }
+    .processing-panel {
+        background: #fafafa; border: 1px solid #ffd4c4; border-radius: 10px;
+        padding: 16px; margin-top: 12px;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -116,7 +156,7 @@ st.sidebar.title("🛒 Product Sourcing")
 status_filter = st.sidebar.selectbox(
     "Status",
     [s.value for s in PipelineStatus],
-    index=3,  # "review_pending"
+    index=3,
 )
 
 products = _run_async(load_products(PipelineStatus(status_filter)))
@@ -125,7 +165,6 @@ st.sidebar.metric("Products", len(products))
 st.sidebar.markdown("---")
 if st.sidebar.button("📤 Export Approved CSV"):
     from src.shopify.csv_exporter import CSVExporter
-
     approved = _run_async(load_products(PipelineStatus.APPROVED))
     if approved:
         path = CSVExporter().export(approved, "data/exports/approved.csv")
@@ -143,6 +182,8 @@ if not products:
 for idx, product in enumerate(products):
     imgs = [img for img in product.images if img and Path(img).exists()]
     skus = product.sku_prices if isinstance(product.sku_prices, list) else []
+    pid = product.id or f"p{idx}"
+    handle = product.make_handle()
 
     score = product.market_score.total if product.market_score else 0
     score_color = "#52c41a" if score >= 70 else "#faad14" if score >= 50 else "#ff4d4f"
@@ -151,23 +192,23 @@ for idx, product in enumerate(products):
     platform_name = product.platform.value.upper() if product.platform else "?"
     title_display = product.title_en or product.title_cn[:80]
 
+    is_processing = st.session_state.get(f"processing_{pid}", False)
+
     with st.expander(
         f"{score_emoji} [{platform_name}] {title_display}  —  Score: {score}/100",
-        expanded=(len(products) <= 3),
+        expanded=(len(products) <= 3 or is_processing),
     ):
-        # ═══════════════════ TOP ROW: Image Gallery + Info ═══════════
+        # ═════════ TOP: Image Gallery + Info ═════════
         col_left, col_right = st.columns([1.2, 1], gap="medium")
 
         with col_left:
-            # ── Main image ──
             if imgs:
-                thumb_key = f"thumb_idx_{product.id}"
+                thumb_key = f"thumb_{pid}"
                 if thumb_key not in st.session_state:
                     st.session_state[thumb_key] = 0
                 thumb_idx = max(0, min(st.session_state[thumb_key], len(imgs) - 1))
-                st.image(str(imgs[thumb_idx]), use_container_width=True)
+                st.image(str(imgs[thumb_idx]), width="stretch")
 
-                # Thumbnail strip — compact row
                 if len(imgs) > 1:
                     n_cols = min(len(imgs), 6)
                     cols = st.columns(n_cols, gap="small")
@@ -178,44 +219,34 @@ for idx, product in enumerate(products):
                             opacity = "1" if active else "0.55"
                             st.markdown(
                                 f'<div style="border:{border}; border-radius:6px; '
-                                f'padding:1px; opacity:{opacity}; cursor:pointer; '
-                                f'transition:opacity 0.15s;">',
-                                unsafe_allow_html=True,
-                            )
-                            st.image(str(img), use_container_width=True)
+                                f'padding:1px; opacity:{opacity};">', unsafe_allow_html=True)
+                            st.image(str(img), width="stretch")
                             st.markdown('</div>', unsafe_allow_html=True)
-                            if st.button(" ", key=f"thumb_{product.id}_{i}", help=f"View image {i+1}"):
+                            if st.button(" ", key=f"thumb_{pid}_{i}", help=f"View {i+1}"):
                                 st.session_state[thumb_key] = i
                                 st.rerun()
-
-                st.caption(f"📷 {len(imgs)} main images | {len(product.desc_images)} detail images")
+                st.caption(f"📷 {len(imgs)} main | {len(product.desc_images)} detail images")
             else:
-                st.info("No images available")
+                st.info("No images")
 
-            # ── Description (CN) ──
             if product.description_cn:
-                st.markdown(
-                    '<span class="section-title">📝 商品描述</span>',
-                    unsafe_allow_html=True,
-                )
+                st.markdown('<span class="section-title">📝 商品描述</span>', unsafe_allow_html=True)
                 desc_text = product.description_cn[:500]
                 if len(product.description_cn) > 500:
                     desc_text += "..."
                 st.markdown(
-                    f'<div style="font-size:13px; color:#666; line-height:1.7; '
-                    f'padding:10px; background:#fafafa; border-radius:8px; '
+                    f'<div style="font-size:13px;color:#666;line-height:1.7;'
+                    f'padding:10px;background:#fafafa;border-radius:8px;'
                     f'border:1px solid #f0f0f0;">{desc_text}</div>',
                     unsafe_allow_html=True,
                 )
 
         with col_right:
-            # ── Price ──
+            # Price
             st.markdown('<span class="section-title">💰 价格</span>', unsafe_allow_html=True)
-
             price_str = product.price_cn or ""
             current_price = price_str
             original_price = ""
-
             coupon_match = re.search(r"券后[￥¥](\d+\.?\d*)", price_str)
             orig_match = re.search(r"优惠前[￥¥](\d+\.?\d*)", price_str)
             if coupon_match:
@@ -225,8 +256,7 @@ for idx, product in enumerate(products):
             else:
                 prices = re.findall(r"[￥¥](\d+\.?\d*)", price_str)
                 if len(prices) >= 2:
-                    current_price = f"¥{prices[0]}"
-                    original_price = f"¥{prices[1]}"
+                    current_price, original_price = f"¥{prices[0]}", f"¥{prices[1]}"
                 elif prices:
                     current_price = f"¥{prices[0]}"
 
@@ -238,24 +268,18 @@ for idx, product in enumerate(products):
                     unsafe_allow_html=True,
                 )
                 usd_str = f"${product.price_usd:.2f}" if product.price_usd else "—"
-                st.markdown(
-                    f'<span class="price-usd">💲 {usd_str} USD</span>',
-                    unsafe_allow_html=True,
-                )
+                st.markdown(f'<span class="price-usd">💲 {usd_str} USD</span>', unsafe_allow_html=True)
             with p_col2:
                 st.markdown(
                     f'<div class="score-card" style="border-color:{score_color};">'
-                    f'<div style="font-size:28px; font-weight:700; color:{score_color};">{score}</div>'
-                    f'<div style="font-size:11px; color:#999;">/ 100</div></div>',
+                    f'<div style="font-size:28px;font-weight:700;color:{score_color};">{score}</div>'
+                    f'<div style="font-size:11px;color:#999;">/ 100</div></div>',
                     unsafe_allow_html=True,
                 )
 
-            # ── Market score breakdown — native st.progress ──
+            # Score breakdown
             if product.market_score:
-                st.markdown(
-                    '<span class="section-title">📊 AI 分析</span>',
-                    unsafe_allow_html=True,
-                )
+                st.markdown('<span class="section-title">📊 AI 分析</span>', unsafe_allow_html=True)
                 ms = product.market_score
                 dims = [
                     ("Visual Appeal", ms.visual_appeal, 25),
@@ -268,140 +292,408 @@ for idx, product in enumerate(products):
                     pct = val / max_val if max_val else 0
                     bc1, bc2, bc3 = st.columns([2.4, 5, 0.8], gap="small")
                     with bc1:
-                        st.markdown(
-                            f'<span class="bar-label">{name}</span>',
-                            unsafe_allow_html=True,
-                        )
+                        st.markdown(f'<span class="bar-label">{name}</span>', unsafe_allow_html=True)
                     with bc2:
                         st.progress(min(pct, 1.0))
                     with bc3:
                         st.caption(f"{val:.0f}")
 
-                if ms.reasoning:
-                    with st.expander("💡 Reasoning", expanded=False):
-                        st.caption(ms.reasoning)
-
-            # ── Tags ──
             if product.tags:
-                tag_html = " ".join(
-                    f'<span class="tag-pill">{t}</span>' for t in product.tags[:12]
-                )
-                st.markdown(
-                    f'<div style="margin-top:8px;">{tag_html}</div>',
-                    unsafe_allow_html=True,
-                )
+                tag_html = " ".join(f'<span class="tag-pill">{t}</span>' for t in product.tags[:12])
+                st.markdown(f'<div style="margin-top:8px;">{tag_html}</div>', unsafe_allow_html=True)
 
-        # ═══════════════════ SKU Gallery ═══════════════════════
+        # ── SKU Gallery ──
         if skus:
             st.markdown("---")
             st.markdown('<span class="section-title">📦 SKU 规格</span>', unsafe_allow_html=True)
-
-            real_skus = [
-                s
-                for s in skus
-                if s.get("name", "") and "推荐" not in s.get("name", "")
-                and "颜色分类" not in s.get("name", "")
-                and "⭐" not in s.get("name", "")
-                and "宝贝" != s.get("name", "")
-            ]
+            real_skus = [s for s in skus if s.get("name","") and "推荐" not in s.get("name","")
+                         and "颜色分类" not in s.get("name","") and "宝贝" != s.get("name","")]
             if not real_skus:
                 real_skus = skus
-
-            sku_cols_per_row = 5
-            for row_start in range(0, len(real_skus), sku_cols_per_row):
-                row_skus = real_skus[row_start : row_start + sku_cols_per_row]
-                cols = st.columns(sku_cols_per_row, gap="small")
+            for row_start in range(0, len(real_skus), 5):
+                row_skus = real_skus[row_start:row_start+5]
+                cols = st.columns(5, gap="small")
                 for ci, sku in enumerate(row_skus):
                     if ci >= len(cols):
                         break
                     with cols[ci]:
-                        sku_name = sku.get("name", "?")[:30]
-                        sku_price = sku.get("price", "")
                         sku_imgs = sku.get("images", [])
-
                         sku_img_path = None
                         if isinstance(sku_imgs, list) and sku_imgs:
                             for si in sku_imgs:
-                                if isinstance(si, str):
-                                    if si.startswith(("http://", "https://")) or Path(si).exists():
-                                        sku_img_path = si
-                                        break
-
+                                if isinstance(si, str) and (si.startswith(("http","https")) or Path(si).exists()):
+                                    sku_img_path = si
+                                    break
                         if sku_img_path:
-                            st.image(str(sku_img_path), use_container_width=True)
-
-                        price_display = sku_price if sku_price else "—"
+                            st.image(str(sku_img_path), width="stretch")
+                        price_display = sku.get("price", "") or "—"
                         st.markdown(
-                            f'<div class="sku-card">'
-                            f'<div class="sku-name">{sku_name}</div>'
-                            f'<div class="sku-price-tag">{price_display}</div>'
-                            f'</div>',
+                            f'<div class="sku-card"><div class="sku-name">{sku.get("name","?")[:30]}</div>'
+                            f'<div class="sku-price-tag">{price_display}</div></div>',
                             unsafe_allow_html=True,
                         )
 
-        # ═══════════════════ Detail Images ═════════════════════
+        # ── Detail Images ──
         if product.desc_images:
-            desc_imgs_exist = [
-                img for img in product.desc_images if img and Path(img).exists()
-            ]
+            desc_imgs_exist = [img for img in product.desc_images if img and Path(img).exists()]
             if desc_imgs_exist:
                 st.markdown("---")
-                st.markdown(
-                    '<span class="section-title">🖼️ 图文详情</span>',
-                    unsafe_allow_html=True,
-                )
+                st.markdown('<span class="section-title">🖼️ 图文详情</span>', unsafe_allow_html=True)
                 d_cols = st.columns(min(len(desc_imgs_exist), 3), gap="small")
                 for di, dimg in enumerate(desc_imgs_exist[:12]):
                     col_idx = di % 3
                     if col_idx < len(d_cols):
                         with d_cols[col_idx]:
-                            st.image(str(dimg), use_container_width=True)
-                if len(desc_imgs_exist) > 12:
-                    st.caption(f"... and {len(desc_imgs_exist) - 12} more detail images")
+                            st.image(str(dimg), width="stretch")
 
-        # ═══════════════════ Edit & Actions ═══════════════════
+        # ═══════════════════ ACTIONS ═══════════════════════════
         st.markdown("---")
-        st.markdown(
-            '<span class="section-title">✏️ 编辑 & 操作</span>',
-            unsafe_allow_html=True,
-        )
+        st.markdown('<span class="section-title">✏️ 编辑 & 操作</span>', unsafe_allow_html=True)
 
         ec1, ec2 = st.columns([3, 1], gap="medium")
         with ec1:
-            title_en = st.text_input(
-                "English Title", product.title_en or "", key=f"t_{product.id}"
-            )
-            price = st.number_input(
-                "Price (USD)", value=product.price_usd, step=0.99, key=f"p_{product.id}"
-            )
+            title_en = st.text_input("English Title", product.title_en or "", key=f"t_{pid}")
+            price = st.number_input("Price (USD)", value=product.price_usd, step=0.99, key=f"p_{pid}")
             desc = st.text_area(
-                "Optimized Description",
-                product.optimized_description or product.description_en or "",
-                height=120,
-                key=f"d_{product.id}",
+                "Optimized Description", product.optimized_description or product.description_en or "",
+                height=100, key=f"d_{pid}",
             )
-            tags = st.text_input(
-                "Tags (comma-separated)",
-                ", ".join(product.tags),
-                key=f"tg_{product.id}",
-            )
+            tags = st.text_input("Tags (comma-separated)", ", ".join(product.tags), key=f"tg_{pid}")
         with ec2:
             st.markdown("<br>" * 2, unsafe_allow_html=True)
-            if st.button("✅ Approve", key=f"app_{product.id}", type="primary"):
-                product.title_en = title_en
-                product.price_usd = price
-                product.optimized_description = desc
-                product.tags = [t.strip() for t in tags.split(",") if t.strip()]
-                product.status = PipelineStatus.APPROVED
-                _run_async(repo.save(product))
+
+            if not is_processing:
+                if st.button("✅ Approve & Process", key=f"app_{pid}", type="primary"):
+                    product.title_en = title_en
+                    product.price_usd = price
+                    product.optimized_description = desc
+                    product.tags = [t.strip() for t in tags.split(",") if t.strip()]
+                    product.status = PipelineStatus.APPROVED
+                    _run_async(repo.save(product))
+                    st.session_state[f"processing_{pid}"] = True
+                    st.rerun()
+
+                col_r, col_a = st.columns(2, gap="small")
+                with col_r:
+                    if st.button("❌ Reject", key=f"rej_{pid}"):
+                        product.status = PipelineStatus.REJECTED
+                        _run_async(repo.save(product))
+                        st.rerun()
+                with col_a:
+                    if st.button("📦 Archive", key=f"arc_{pid}"):
+                        product.status = PipelineStatus.ARCHIVED
+                        _run_async(repo.save(product))
+                        st.rerun()
+            else:
+                # After save edits
+                if st.button("💾 Save Edits", key=f"save_{pid}"):
+                    product.title_en = title_en
+                    product.price_usd = price
+                    product.optimized_description = desc
+                    product.tags = [t.strip() for t in tags.split(",") if t.strip()]
+                    _run_async(repo.save(product))
+                    st.success("Saved")
+                    st.rerun()
+
+        # ═══════════ PROCESSING PANEL (after Approve) ═══════════
+        if not is_processing:
+            continue
+
+        # Initialize processing session state
+        PP = f"proc_{pid}"
+        image_paths = _get_all_image_paths(product)
+        if f"{PP}_names" not in st.session_state:
+            st.session_state[f"{PP}_names"] = {i: f"{handle}_{i+1:02d}" for i in range(len(image_paths))}
+        if f"{PP}_selected" not in st.session_state:
+            st.session_state[f"{PP}_selected"] = set(range(len(image_paths)))
+        if f"{PP}_processed" not in st.session_state:
+            st.session_state[f"{PP}_processed"] = {}
+        if f"{PP}_webp" not in st.session_state:
+            st.session_state[f"{PP}_webp"] = {}
+        if f"{PP}_meta" not in st.session_state:
+            st.session_state[f"{PP}_meta"] = {}
+        if f"{PP}_img_prompts" not in st.session_state:
+            default_prompt = f"Background removal, US-market color grading, 2048x2048 resize, English text overlay if applicable."
+            st.session_state[f"{PP}_img_prompts"] = {i: default_prompt for i in range(len(image_paths))}
+        if f"{PP}_step" not in st.session_state:
+            st.session_state[f"{PP}_step"] = "image"
+
+        current_step = st.session_state[f"{PP}_step"]
+
+        # ═══════════════════════════════════════════════════════
+        #  STEP 1: IMAGE PROCESSING
+        # ═══════════════════════════════════════════════════════
+        if current_step == "image":
+            st.markdown("---")
+            st.markdown("## 🖼️ Step 1: Image Processing")
+
+            if not image_paths:
+                st.warning("No local images found for this product. Proceed to text processing.")
+                if st.button("⏭ Skip to Text Processing", key=f"{PP}_skip_img", type="primary"):
+                    st.session_state[f"{PP}_step"] = "text"
+                    st.rerun()
+            else:
+                # ── 1A: Image Selection & Renaming ──
+                st.markdown('<span class="section-title">📷 Select & Rename Images</span>', unsafe_allow_html=True)
+                st.caption(f"{len(image_paths)} images available — check to select, edit names below")
+
+                select_all = st.checkbox("Select All", value=True, key=f"{PP}_all")
+                cur_sel = st.session_state[f"{PP}_selected"]
+                if select_all:
+                    cur_sel = set(range(len(image_paths)))
+                else:
+                    cur_sel = set()
+                st.session_state[f"{PP}_selected"] = cur_sel
+
+                for i, (label, path) in enumerate(image_paths):
+                    if not path.exists():
+                        continue
+                    webp = st.session_state[f"{PP}_webp"]
+                    proc = st.session_state[f"{PP}_processed"]
+                    prompts = st.session_state[f"{PP}_img_prompts"]
+
+                    with st.container(border=True):
+                        c_chk, c_img, c_info = st.columns([0.2, 1.5, 3], gap="small")
+                        with c_chk:
+                            st.markdown("<br>" * 5, unsafe_allow_html=True)
+                            sel = st.checkbox("✓", value=i in cur_sel, key=f"{PP}_sel_{i}", label_visibility="visible")
+                            if sel:
+                                cur_sel.add(i)
+                            else:
+                                cur_sel.discard(i)
+                            if i in webp:
+                                st.success("WebP")
+                            elif i in proc:
+                                st.info("Done")
+                            else:
+                                st.caption(path.suffix)
+                        with c_img:
+                            st.image(str(path), width="stretch")
+                        with c_info:
+                            names = st.session_state[f"{PP}_names"]
+                            current = names.get(i, "")
+                            new_name = st.text_input("Image Name", value=current, key=f"{PP}_nm_{i}", placeholder="e.g. product_main_01")
+                            names[i] = new_name.strip() or current
+                            st.session_state[f"{PP}_names"] = names
+                            current_prompt = prompts.get(i, "")
+                            new_prompt = st.text_area(
+                                "Processing Prompt",
+                                value=current_prompt,
+                                height=68,
+                                key=f"{PP}_prompt_{i}",
+                                placeholder="Describe how to process this image...",
+                            )
+                            prompts[i] = new_prompt
+                            st.session_state[f"{PP}_img_prompts"] = prompts
+
+                # Bulk rename
+                c_bulk1, c_bulk2 = st.columns([3, 1], gap="small")
+                with c_bulk1:
+                    bulk_prefix = st.text_input("Bulk rename prefix", value=handle, key=f"{PP}_prefix")
+                with c_bulk2:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    if st.button("📝 Apply Prefix", key=f"{PP}_apply"):
+                        names = st.session_state[f"{PP}_names"]
+                        for i in sorted(cur_sel):
+                            names[i] = f"{bulk_prefix}_{i+1:02d}"
+                        st.session_state[f"{PP}_names"] = names
+                        st.rerun()
+
+                # ── 1B: Send to Image API ──
+                st.markdown("---")
+                st.markdown('<span class="section-title">🚀 Process Images</span>', unsafe_allow_html=True)
+
+                selected_list = sorted(cur_sel)
+                api_client = ImageAPIClient()
+                api_ready = api_client.configured
+
+                if not selected_list:
+                    st.warning("No images selected")
+                else:
+                    st.caption(f"{len(selected_list)} image(s) selected for processing")
+
+                # Diagnostics
+                with st.expander("🔧 API Config Debug", expanded=not api_ready):
+                    st.caption(f"base_url: `{api_client.base_url or '(empty)'}`")
+                    st.caption(f"api_key: `{'***' + api_client.api_key[-4:] if api_client.api_key and len(api_client.api_key) > 4 else '(not set)'}`")
+                    st.caption(f"is_gemini: {api_client._is_gemini}")
+                    st.caption(f"model: {api_client.model}")
+                    st.caption(f"configured: {api_client.configured}")
+
+                c_api1, c_api2 = st.columns([2, 1], gap="medium")
+                with c_api1:
+                    if st.button("🚀 Send to Image API", key=f"{PP}_api", type="primary", disabled=not (api_ready and selected_list)):
+                        with st.spinner(f"Processing {len(selected_list)} images..."):
+                            prompts = st.session_state[f"{PP}_img_prompts"]
+                            for idx in selected_list:
+                                try:
+                                    img_prompt = prompts.get(idx, "")
+                                    data = _run_async(api_client.process(image_paths[idx][1], prompt=img_prompt))
+                                    st.session_state[f"{PP}_processed"][idx] = data
+                                except Exception as exc:
+                                    st.error(f"Failed {image_paths[idx][1].name}: {exc}")
+                        st.rerun()
+                with c_api2:
+                    if not api_ready:
+                        st.caption("⚠️ IMAGE_API_BASE_URL is empty — set it in .env then restart")
+
+                # ── 1C: Processed Preview ──
+                processed = st.session_state[f"{PP}_processed"]
+                if processed:
+                    st.markdown("---")
+                    st.markdown('<span class="section-title">👁 Preview Processed Images</span>', unsafe_allow_html=True)
+                    st.caption(f"{len(processed)} image(s) processed")
+                    pcols = st.columns(min(len(processed), 4))
+                    for pi, (idx, data) in enumerate(processed.items()):
+                        col_idx = pi % 4
+                        if col_idx < len(pcols):
+                            with pcols[col_idx]:
+                                name = st.session_state[f"{PP}_names"].get(idx, f"img_{idx}")
+                                st.caption(name)
+                                st.image(data, width="stretch")
+
+                    # ── 1D: WebP Convert ──
+                    st.markdown("---")
+                    st.markdown('<span class="section-title">🔄 Convert to WebP</span>', unsafe_allow_html=True)
+                    st.caption("Convert all processed images to WebP format for Shopify")
+
+                    if st.button("🔄 Convert All to WebP", key=f"{PP}_webp_btn", type="primary"):
+                        with st.spinner("Converting to WebP..."):
+                            from PIL import Image
+                            for idx, data in processed.items():
+                                try:
+                                    img = Image.open(io.BytesIO(data))
+                                    img = img.convert("RGBA") if img.mode in ("RGBA","P","LA") else img.convert("RGB")
+                                    buf = io.BytesIO()
+                                    img.save(buf, "WEBP", quality=85, method=6)
+                                    st.session_state[f"{PP}_webp"][idx] = buf.getvalue()
+                                except Exception as exc:
+                                    st.error(f"WebP failed {idx}: {exc}")
+                        st.rerun()
+
+                # ── 1E: Download WebP ──
+                webp_data = st.session_state[f"{PP}_webp"]
+                if webp_data:
+                    st.markdown("---")
+                    st.markdown('<span class="section-title">⬇ Download WebP Images</span>', unsafe_allow_html=True)
+                    st.success(f"✅ {len(webp_data)} WebP image(s) ready for download")
+                    wcols = st.columns(min(len(webp_data), 3))
+                    for wi, (idx, data) in enumerate(webp_data.items()):
+                        col_idx = wi % 3
+                        if col_idx < len(wcols):
+                            with wcols[col_idx]:
+                                name = st.session_state[f"{PP}_names"].get(idx, f"img_{idx}")
+                                st.download_button(
+                                    f"⬇ {name}.webp", data=data, file_name=f"{name}.webp",
+                                    mime="image/webp", key=f"{PP}_dl_{idx}",
+                                )
+
+                # ── 1F: Navigate to Text Processing ──
+                st.markdown("---")
+                st.markdown('<span class="section-title">➡ Next: Text Processing</span>', unsafe_allow_html=True)
+                st.caption("Once images are processed, proceed to text processing for metafields and Excel export.")
+
+                webp_ready = bool(st.session_state.get(f"{PP}_webp"))
+                c_next1, c_next2 = st.columns([1, 1], gap="medium")
+                with c_next1:
+                    if st.button("📄 Proceed to Text Processing →", key=f"{PP}_to_text", type="primary"):
+                        st.session_state[f"{PP}_step"] = "text"
+                        st.rerun()
+                with c_next2:
+                    if not webp_ready:
+                        st.caption("💡 Tip: Convert images to WebP first for a complete Excel export.")
+
+        # ═══════════════════════════════════════════════════════
+        #  STEP 2: TEXT PROCESSING
+        # ═══════════════════════════════════════════════════════
+        else:
+            st.markdown("---")
+            st.markdown("## 📄 Step 2: Text Processing")
+
+            # Back to image processing
+            if st.button("← Back to Image Processing", key=f"{PP}_back_img"):
+                st.session_state[f"{PP}_step"] = "image"
                 st.rerun()
 
-            if st.button("❌ Reject", key=f"rej_{product.id}"):
-                product.status = PipelineStatus.REJECTED
-                _run_async(repo.save(product))
+            # ── 2A: Product Info Summary ──
+            st.markdown('<span class="section-title">📋 Product Summary</span>', unsafe_allow_html=True)
+            with st.container(border=True):
+                st.markdown(f"**{product.title_en or product.title_cn}**")
+                st.caption(f"Handle: `{handle}`")
+                st.caption(f"Price: {product.price_cn or 'N/A'}  |  USD: ${product.price_usd:.2f}" if product.price_usd else "")
+                st.caption(f"Tags: {', '.join(product.tags[:8]) if product.tags else '—'}")
+
+            # ── 2B: AI Metafields ──
+            st.markdown("---")
+            st.markdown('<span class="section-title">🤖 AI Metafields</span>', unsafe_allow_html=True)
+            st.caption("Generate Shopify metafields (description, inspiration, highlights, notices) via AI")
+
+            meta = st.session_state[f"{PP}_meta"]
+
+            if not meta:
+                if st.button("🧠 Generate with AI", key=f"{PP}_meta_gen", type="primary"):
+                    with st.spinner("AI generating metafields..."):
+                        meta = _run_async(_generate_metafields(product))
+                        st.session_state[f"{PP}_meta"] = meta
+                    st.rerun()
+            else:
+                st.success("Metafields generated. Edit below if needed.")
+
+            m_desc = st.text_area("custom.description", value=meta.get("description",""), height=120, key=f"{PP}_desc")
+            m_insp = st.text_area("custom.inspiration", value=meta.get("inspiration",""), height=80, key=f"{PP}_insp")
+            m_high = st.text_area("custom.highlights", value=meta.get("highlights",""), height=80, key=f"{PP}_high")
+            m_noti = st.text_area("custom.notices", value=meta.get("notices",""), height=80, key=f"{PP}_noti")
+
+            if st.button("💾 Save Metafields", key=f"{PP}_meta_save"):
+                st.session_state[f"{PP}_meta"] = {
+                    "description": m_desc, "inspiration": m_insp,
+                    "highlights": m_high, "notices": m_noti,
+                }
+                st.success("Metafields saved")
                 st.rerun()
 
-            if st.button("📦 Archive", key=f"arc_{product.id}"):
-                product.status = PipelineStatus.ARCHIVED
-                _run_async(repo.save(product))
-                st.rerun()
+            # ── 2C: SKU Variants ──
+            if skus:
+                st.markdown("---")
+                st.markdown('<span class="section-title">📦 SKU Variants</span>', unsafe_allow_html=True)
+                real = [s for s in skus if s.get("name","") and "推荐" not in s.get("name","")
+                        and "颜色分类" not in s.get("name","")]
+                if real:
+                    st.dataframe(
+                        [{"#": i+1, "Name": s.get("name","")[:40],
+                          "Price": re.sub(r"[^\d.]","",str(s.get("price",""))),
+                          "Imgs": len(s.get("images",[]))} for i, s in enumerate(real)],
+                        width="stretch", hide_index=True,
+                    )
+
+            # ── 2D: Excel Export ──
+            st.markdown("---")
+            st.markdown('<span class="section-title">📥 Export 导入表.xlsx</span>', unsafe_allow_html=True)
+            st.caption("Generate the Shopify import Excel file (requires WebP images)")
+
+            vendor = st.text_input("Vendor", key=f"{PP}_vendor")
+
+            webp_ready = bool(st.session_state.get(f"{PP}_webp"))
+            if st.button("📊 Generate Import Excel", key=f"{PP}_exp", type="primary", disabled=not webp_ready):
+                names = st.session_state.get(f"{PP}_names", {})
+                webp = st.session_state.get(f"{PP}_webp", {})
+                img_list = [f"{names.get(idx, f'img_{idx}')}.webp" for idx in sorted(webp.keys())]
+                current_meta = {
+                    "description": m_desc, "inspiration": m_insp,
+                    "highlights": m_high, "notices": m_noti,
+                }
+                output = export_products_to_xlsx(
+                    products=[product],
+                    image_paths={pid: img_list} if img_list else None,
+                    metafields={pid: current_meta} if current_meta else None,
+                    output_path="data/exports/import_table.xlsx",
+                )
+                st.success(f"Exported to {output}")
+                with open(output, "rb") as f:
+                    st.download_button(
+                        "⬇ Download Excel", data=f, file_name="import_table.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"{PP}_dl_xlsx",
+                    )
+            if not webp_ready:
+                st.caption("⚠️ Process images to WebP first (Step 1) — required for complete Excel generation")
