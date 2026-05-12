@@ -12,9 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import streamlit as st
 
-from src.config import config
 from src.db.repository import ProductRepository
-from src.llm.service import LLMService
+from src.llm import create_llm_service
 from src.models.product import PipelineStatus, Product
 from src.processing.image_api import ImageAPIClient
 from src.webui.excel_exporter import export_products_to_xlsx
@@ -89,13 +88,7 @@ def _get_all_image_paths(product: Product) -> list[tuple[str, Path]]:
 
 
 async def _generate_metafields(product: Product) -> dict[str, str]:
-    cfg = config.ai
-    llm = LLMService(
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url", ""),
-        model_text=cfg.get("model_text", "deepseek-chat"),
-        temperature=0.3,
-    )
+    llm = create_llm_service()
     prompt = METAFIELDS_GEN_PROMPT.format(
         title_en=product.title_en or product.title_cn,
         description_en=product.description_en or product.description_cn[:1000],
@@ -169,11 +162,11 @@ products = _run_async(load_products(PipelineStatus(status_filter)))
 st.sidebar.metric("Products", len(products))
 
 st.sidebar.markdown("---")
-if st.sidebar.button("📤 Export Approved CSV"):
-    from src.shopify.csv_exporter import CSVExporter
+if st.sidebar.button("Export Approved Excel"):
+    from src.webui.excel_exporter import export_products_to_xlsx
     approved = _run_async(load_products(PipelineStatus.APPROVED))
     if approved:
-        path = CSVExporter().export(approved, "data/exports/approved.csv")
+        path = export_products_to_xlsx(approved, output_path="data/exports/approved.xlsx")
         st.sidebar.success(f"Exported {len(approved)}")
     else:
         st.sidebar.warning("No approved products")

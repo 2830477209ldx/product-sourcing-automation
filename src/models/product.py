@@ -25,6 +25,7 @@ class PipelineStatus(str, Enum):
 class Platform(str, Enum):
     XIAOHONGSHU = "xiaohongshu"
     TAOBAO = "taobao"
+    TMALL = "tmall"
     ALIBABA = "alibaba"
 
 

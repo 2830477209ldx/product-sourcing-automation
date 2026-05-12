@@ -1,8 +1,8 @@
-"""Product extraction — AI browser navigation + AI-driven data extraction.
+"""Product extraction — AI browser navigation + container-classified extraction.
 
 Navigation:     browser_use Agent (handles QR login, redirects)
-Extraction:     SlimDOMExtractor (AI reads page → structured data directly)
-Fallback:       Layout-based JS image collectors (no CSS selectors)
+Extraction:     SlimDOMExtractor (container classification + targeted extraction)
+Fallback:       Container-based position heuristics (no CSS selectors)
 Cookie:         browser_use CDP-based export_storage_state() → cookies.json
 """
 
@@ -20,50 +20,18 @@ from loguru import logger
 
 from src.agents.slimdom_extractor import (
     JS_CLICK_SKU_BY_LABEL,
-    JS_COLLECT_POST_CLICK,
-    JS_EXTRACT_BETWEEN_MARKERS,
-    JS_LAYOUT_GALLERY,
-    JS_LAYOUT_SKU_CLUSTER,
+    JS_COLLECT_CONTAINERS,
+    JS_DETECT_SKU_TYPE,
+    JS_SNAPSHOT_VISIBLE_IMAGES,
     SlimDOMExtractor,
 )
 from src.config import config
-from src.llm.service import LLMService
+from src.llm import create_llm_service
 from src.utils import SKIP_IMAGE_PATTERNS
 
 PROFILE_DIR = Path("data/browser_profile")
 PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 COOKIES_FILE = Path("data/cookies.json")
-
-
-# ═══════════════════════════════════════════════════════════════
-# Layout-based image collectors (no CSS selectors — used as fallback)
-# ═══════════════════════════════════════════════════════════════
-
-JS_LAYOUT_GALLERY_BROAD = JS_LAYOUT_GALLERY  # reuse from slimdom_extractor
-
-JS_LAYOUT_SKU_CLUSTER_BROAD = JS_LAYOUT_SKU_CLUSTER  # reuse
-
-JS_BETWEEN_MARKERS_BROAD = JS_EXTRACT_BETWEEN_MARKERS  # reuse
-
-JS_CURRENT_PRICE = """() => {
-    for (const sel of [
-        '[class*="tm-promo-price"]', '[class*="tmPrice"]', '[class*="tbPrice"]',
-        '.tm-price', '.tb-price',
-        '[class*="Price"] [class*="price"]', '[class*="price"] [class*="value"]',
-        'span[class*="price"]', 'em[class*="price"]', 'b[class*="price"]',
-        '[class*="totalPrice"]', '[class*="salePrice"]', '[class*="promoPrice"]',
-        '[class*="currentPrice"]', '[class*="nowPrice"]',
-        'div[class*="PriceBox"] span',
-    ]) {
-        const el = document.querySelector(sel);
-        if (el) {
-            const t = el.textContent.trim();
-            const m = t.match(/[¥￥]?\\s*(\\d+\\.?\\d*)/);
-            if (m && m[1]) return '¥' + m[1];
-        }
-    }
-    return '';
-}"""
 
 ALICDN_IMG_RE = re.compile(r'img\.alicdn\.com|img\.taobaocdn\.com|gw\.alicdn\.com')
 
@@ -86,7 +54,7 @@ def _normalize_img_url(url: str) -> str:
 
 
 class ProductAgent:
-    """AI browser for navigation + AI-driven extraction (no hardcoded selectors)."""
+    """AI browser for navigation + container-classified extraction."""
 
     def __init__(self, headless: bool = False) -> None:
         self.headless = headless
@@ -111,13 +79,11 @@ class ProductAgent:
                         await asyncio.sleep(3)
                     else:
                         raise
-
         return self._browser
 
     async def extract(self, url: str) -> dict[str, Any]:
         browser = await self._get_browser()
 
-        # ── Phase 1: AI Agent navigates + handles login ──
         agent = Agent(
             task=(
                 f"Navigate to {url}. "
@@ -142,7 +108,6 @@ class ProductAgent:
             logger.error("No page available after agent run")
             return {"_error": "no page"}
 
-        # ── Verify page loaded ──
         body_len = 0
         current_url = ""
         for attempt in range(20):
@@ -154,7 +119,6 @@ class ProductAgent:
             except Exception:
                 body_len = 0
                 current_url = ""
-
             if body_len > 500 and "login" not in str(current_url).lower():
                 break
             if attempt == 0:
@@ -164,13 +128,11 @@ class ProductAgent:
         if body_len < 200:
             logger.warning(f"Page appears empty ({body_len} chars), proceeding anyway")
 
-        # Guard: if still on login page, abort extraction
         if "login" in str(current_url).lower():
-            print("\n  ⚠️  Still on login page — please scan the QR code with Taobao app.")
+            print("\n  Still on login page — scan the QR code with Taobao app.")
             print("  The browser profile is new. After this login, all future runs auto-login.\n")
             return {"_error": "login_required", "source_url": url}
 
-        # ── Save cookies ──
         try:
             storage_state = await browser.export_storage_state()
             if storage_state and storage_state.get("cookies"):
@@ -181,161 +143,136 @@ class ProductAgent:
         except Exception as exc:
             logger.debug(f"Cookie save failed: {exc}")
 
-        # ── Phase 2: AI reads page structure, outputs product data directly ──
-        llm = LLMService(
-            api_key=config.ai["api_key"],
-            base_url=config.ai.get("base_url", ""),
-            model_text=config.ai.get("model_text", "deepseek-chat"),
-            temperature=0.1,
-        )
+        llm = create_llm_service(temperature=0.1)
         extractor = SlimDOMExtractor(llm)
         ai_result = await extractor.extract(page, url)
 
         if ai_result.get("_error"):
-            print(f"  [AI] Extraction failed ({ai_result['_error']}), using layout fallback...")
-            ai_result = await self._layout_fallback_extraction(page)
+            print(f"  [AI] Extraction failed ({ai_result['_error']}), using fallback...")
+            ai_result = await self._fallback_extraction(page, url)
 
-        # ── Phase 3: Collect layout images ──
-        layout = await extractor.collect_layout_images(page)
-
-        # ── Phase 4: Merge + filter results ──
-        result = self._merge_results(ai_result, layout)
+        result = self._normalize(ai_result)
         self._print_summary(result)
         return result
 
-    async def _layout_fallback_extraction(self, page) -> dict[str, Any]:
-        """When AI fails, use layout-based JS (no CSS selectors) to collect raw data."""
-        result: dict[str, Any] = {}
+    async def _fallback_extraction(self, page, url: str) -> dict[str, Any]:
+        """Container-based fallback: no CSS selectors, no AI — pure structural heuristics."""
+        result: dict[str, Any] = {"source_url": url}
         try:
-            result["title_cn"] = (await page.get_title() or "")
+            raw = await page.evaluate(JS_COLLECT_CONTAINERS)
+            page_data = json.loads(raw) if isinstance(raw, str) else raw
         except Exception:
-            result["title_cn"] = ""
+            return {"_error": "fallback_collect_failed", "source_url": url}
+
+        containers = page_data.get("containers", [])
+        vh = page_data.get("vh", 800)
+        vw = page_data.get("vw", 375)
+        result["title_cn"] = page_data.get("title", "")
+
+        gallery_imgs = []
+        desc_imgs = []
+        gallery_paths = []
+        desc_paths = []
+
+        for c in containers:
+            p = c.get("p", "")
+            r = c.get("r", [0, 0, 0, 0])
+            w, h, top = r[0], r[1], r[2]
+            im = c.get("im", 0)
+            cls = (c.get("c") or "").lower()
+            tx = (c.get("tx") or "")
+
+            if w < 30 or h < 30 or im == 0:
+                continue
+
+            is_detail = any(k in cls for k in ["detail", "desc", "content", "description"])
+            is_detail = is_detail or any(k in tx for k in ["图文详情", "产品详情", "商品详情"])
+
+            if is_detail or (top > vh * 0.5 and w > vw * 0.8):
+                desc_paths.append(p)
+            elif top < vh * 0.65 and w < vw * 0.85:
+                gallery_paths.append(p)
+
+        for c in containers:
+            for sample in c.get("is", []):
+                src = sample.get("src_hint", "")
+                if not src or not src.startswith("http"):
+                    continue
+                src = _normalize_img_url(src)
+                if not _is_product_image(src):
+                    continue
+                if c.get("p") in gallery_paths and src not in gallery_imgs:
+                    gallery_imgs.append(src)
+                if c.get("p") in desc_paths and src not in desc_imgs:
+                    desc_imgs.append(src)
+
+        result["image_urls"] = gallery_imgs[:8]
+        result["desc_images"] = desc_imgs[:20]
+
         try:
-            result["price_cn"] = await page.evaluate(JS_CURRENT_PRICE)
-            if isinstance(result["price_cn"], str):
-                result["price_cn"] = result["price_cn"].strip()
-        except Exception:
-            result["price_cn"] = ""
-        try:
-            imgs = await page.evaluate(JS_LAYOUT_GALLERY)
-            if isinstance(imgs, str):
-                imgs = json.loads(imgs)
-            result["image_urls"] = imgs if isinstance(imgs, list) else []
-        except Exception:
-            result["image_urls"] = []
-        try:
-            sku = await page.evaluate(JS_LAYOUT_SKU_CLUSTER)
-            if isinstance(sku, str):
-                sku = json.loads(sku)
-            if isinstance(sku, list) and sku:
-                sku_prices = []
-                for s in sku:
-                    label = s.get("label", "")
-                    price = result.get("price_cn", "")
-                    images: list[str] = []
-                    # Click the SKU to get real price + image
-                    try:
-                        clicked = await page.evaluate(JS_CLICK_SKU_BY_LABEL, label)
-                        if clicked:
-                            await asyncio.sleep(1.2)
-                            post = await page.evaluate(JS_COLLECT_POST_CLICK)
-                            if isinstance(post, str):
-                                post = json.loads(post)
-                            if isinstance(post, dict):
-                                if post.get("price"):
-                                    price = post["price"].strip()
-                                if post.get("image"):
-                                    images = [post["image"]]
-                    except Exception:
-                        pass
-                    sku_prices.append({"name": label, "price": price, "images": images})
-                # Reset to first SKU
-                if sku_prices:
-                    try:
-                        await page.evaluate(JS_CLICK_SKU_BY_LABEL, sku_prices[0]["name"])
-                        await asyncio.sleep(0.5)
-                    except Exception:
-                        pass
-                result["sku_prices"] = sku_prices
-            else:
-                result["sku_prices"] = []
-        except Exception:
-            result["sku_prices"] = []
-        try:
-            desc = await page.evaluate(
-                JS_BETWEEN_MARKERS_BROAD,
-                ["图文详情", "产品详情", "商品详情"],
-                ["本店推荐", "猜你喜欢", "看了又看", "店铺推荐"],
-            )
-            if isinstance(desc, str):
-                desc = json.loads(desc)
-            result["desc_images"] = desc if isinstance(desc, list) else []
-        except Exception:
-            result["desc_images"] = []
-        try:
-            pt = await page.evaluate("() => document.body?.innerText || ''")
-            result["description_cn"] = pt[:2000] if isinstance(pt, str) else ""
+            body_text = await page.evaluate("() => (document.body?.innerText || '').slice(0, 2000)")
+            result["description_cn"] = body_text
         except Exception:
             result["description_cn"] = ""
+
+        result["sku_prices"] = []
+        try:
+            sku_info = await page.evaluate(JS_DETECT_SKU_TYPE)
+            if isinstance(sku_info, str):
+                sku_info = json.loads(sku_info)
+            for group in sku_info.get("groups", []):
+                for opt in group.get("options", []):
+                    sku = {"name": opt, "price": "", "images": []}
+                    try:
+                        clicked = await page.evaluate(JS_CLICK_SKU_BY_LABEL, opt)
+                        if clicked:
+                            before = set(await page.evaluate(JS_SNAPSHOT_VISIBLE_IMAGES))
+                            await asyncio.sleep(1.2)
+                            after = set(await page.evaluate(JS_SNAPSHOT_VISIBLE_IMAGES))
+                            diff = list(after - before)
+                            if diff:
+                                sku["images"] = diff[:3]
+                    except Exception:
+                        pass
+                    result["sku_prices"].append(sku)
+            if result["sku_prices"]:
+                try:
+                    await page.evaluate(JS_CLICK_SKU_BY_LABEL, result["sku_prices"][0]["name"])
+                    await asyncio.sleep(0.5)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         return result
 
-    def _merge_results(self, ai: dict, layout: dict) -> dict[str, Any]:
-        """Merge AI extraction with layout-based image collection, deduplicate + filter."""
-        import re
-
+    def _normalize(self, raw: dict) -> dict[str, Any]:
         seen: set[str] = set()
+        result: dict[str, Any] = {}
 
-        def add_urls(target: list, sources: list) -> None:
-            for src in sources:
-                src = _normalize_img_url(str(src))
-                if src not in seen and _is_product_image(src):
-                    seen.add(src)
-                    target.append(src)
+        def dedupe(urls: list) -> list:
+            out = []
+            for u in urls:
+                u = _normalize_img_url(str(u))
+                if u not in seen and _is_product_image(u):
+                    seen.add(u)
+                    out.append(u)
+            return out
 
-        # Validate price_cn format: must be ¥/￥ followed by digits
-        raw_price = ai.get("price_cn", "")
+        result["title_cn"] = raw.get("title_cn", "")
+        result["description_cn"] = raw.get("description_cn", "")
+        result["source_url"] = raw.get("source_url", "")
+
+        raw_price = raw.get("price_cn", "")
         if raw_price and not re.match(r'[¥￥]\s*\d+', str(raw_price)):
             raw_price = ""
+        result["price_cn"] = raw_price
 
-        main_images: list[str] = []
-        add_urls(main_images, ai.get("image_urls", []))
-        add_urls(main_images, layout.get("layout_main_images", []))
+        result["image_urls"] = dedupe(raw.get("image_urls", []))
+        result["desc_images"] = dedupe(raw.get("desc_images", []))
+        result["sku_prices"] = raw.get("sku_prices", [])
 
-        desc_images: list[str] = []
-        add_urls(desc_images, ai.get("desc_images", []))
-        add_urls(desc_images, layout.get("layout_desc_images", []))
-
-        sku_prices = ai.get("sku_prices", [])
-        if not sku_prices:
-            layout_skus = layout.get("layout_sku_items", [])
-            if layout_skus:
-                sku_prices = [
-                    {"name": s.get("label", ""), "price": raw_price}
-                    for s in layout_skus
-                ]
-        if not sku_prices:
-            if raw_price:
-                sku_prices = [{"name": "Default", "price": raw_price, "images": []}]
-
-        # Fallback: if product price is empty, take from first SKU
-        if not raw_price and sku_prices:
-            raw_price = sku_prices[0].get("price", "")
-
-        all_images = main_images + [
-            img for sku in sku_prices
-            for img in sku.get("images", [])
-            if img not in main_images
-        ]
-
-        return {
-            "title_cn": ai.get("title_cn", ""),
-            "price_cn": raw_price,
-            "description_cn": ai.get("description_cn", ""),
-            "image_urls": all_images,
-            "desc_images": desc_images,
-            "sku_prices": sku_prices,
-            "source_url": ai.get("source_url", ""),
-        }
+        return result
 
     def _print_summary(self, result: dict) -> None:
         print("\n" + "=" * 60)
@@ -344,7 +281,6 @@ class ProductAgent:
         print(f"  SKU variants:   {len(result.get('sku_prices', []))}")
         print(f"  Desc images:    {len(result.get('desc_images', []))}")
         print(f"  Price:          {result.get('price_cn', '')}")
-        print(f"  SKU state:      {result.get('sku_state', '')}")
         print("=" * 60)
 
     async def close(self) -> None:
@@ -353,14 +289,12 @@ class ProductAgent:
             self._browser = None
 
     async def extract_batch(self, urls: list[str]) -> list[dict[str, Any]]:
-        """Process multiple URLs in the same browser session (shared cookies, no re-login)."""
         browser = await self._get_browser()
         results: list[dict[str, Any]] = []
 
         for idx, url in enumerate(urls):
             print(f"\n{'─' * 40}\n  Batch [{idx + 1}/{len(urls)}]: {url[:80]}\n{'─' * 40}")
             try:
-                # ── Navigate + handle login ──
                 agent = Agent(
                     task=(
                         f"Navigate to {url}. "
@@ -385,7 +319,6 @@ class ProductAgent:
                     results.append({"_error": "no page", "source_url": url})
                     continue
 
-                # Verify page loaded
                 body_len = 0
                 for attempt in range(15):
                     try:
@@ -401,25 +334,15 @@ class ProductAgent:
                 if body_len < 200:
                     logger.warning(f"Page empty ({body_len} chars) for {url}")
 
-                # ── AI extraction ──
-                llm = LLMService(
-                    api_key=config.ai["api_key"],
-                    base_url=config.ai.get("base_url", ""),
-                    model_text=config.ai.get("model_text", "deepseek-chat"),
-                    temperature=0.1,
-                )
+                llm = create_llm_service(temperature=0.1)
                 extractor = SlimDOMExtractor(llm)
                 ai_result = await extractor.extract(page, url)
 
                 if ai_result.get("_error"):
-                    print(f"  [AI] Extraction failed ({ai_result['_error']}), using layout fallback...")
-                    ai_result = await self._layout_fallback_extraction(page)
+                    print(f"  [AI] Extraction failed ({ai_result['_error']}), using fallback...")
+                    ai_result = await self._fallback_extraction(page, url)
 
-                # Layout image collection
-                layout = await extractor.collect_layout_images(page)
-
-                # Merge + filter
-                result = self._merge_results(ai_result, layout)
+                result = self._normalize(ai_result)
                 self._print_summary(result)
                 results.append(result)
 
@@ -427,7 +350,6 @@ class ProductAgent:
                 logger.error(f"Batch extract failed for {url}: {exc}")
                 results.append({"_error": str(exc), "source_url": url})
 
-        # Save cookies after all URLs processed
         try:
             storage_state = await browser.export_storage_state()
             if storage_state and storage_state.get("cookies"):

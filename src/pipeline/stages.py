@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import uuid
 from pathlib import Path
@@ -13,7 +12,6 @@ from src.db.repository import ProductRepository
 from src.llm.service import LLMService
 from src.models.product import MarketScore, PipelineStatus, Platform, Product
 from src.pipeline import StageResult
-from src.processing.image_styler import ImageStyler
 from src.shopify.csv_exporter import CSVExporter
 from src.utils import clean_price, detect_platform
 from src.downloader import download_images, download_sku_images
@@ -66,7 +64,7 @@ class ExtractStage:
         self.llm = llm
 
     async def run(self, product: Product) -> StageResult[Product]:
-        if not product.description_cn:
+        if not product.description_cn and not product.title_cn:
             return StageResult.fail("No page content to extract from", product)
 
         try:
@@ -144,18 +142,16 @@ class AnalyzeStage:
 
 
 class ProcessStage:
-    """Stage 4: Generate SEO description, download and style images."""
+    """Stage 4: Generate SEO description, download images."""
 
     def __init__(self, llm: LLMService) -> None:
         self.llm = llm
-        self.styler = ImageStyler()
 
     async def run(self, product: Product) -> StageResult[Product]:
         if product.status != PipelineStatus.ANALYZED:
             return StageResult.ok(product)
 
         try:
-            # Build optimized description
             prompt = DESCRIPTION_BUILD_PROMPT.format(
                 title_en=product.title_en,
                 description_en=product.description_en,
@@ -170,28 +166,14 @@ class ProcessStage:
                 product.optimized_description = desc.get("description_html", product.description_en)
                 product.tags = desc.get("suggested_tags", product.tags)
 
-            # Download and process images (run sync styler in thread pool)
             handle = product.make_handle()
             local_images = await download_images(handle, product.images[:10], handle)
             local_sku = await download_sku_images(handle, product.sku_prices)
-            all_local = local_images + local_sku
-            output_dir = Path("data/processed") / product.make_handle()
-            processed = []
-            loop = asyncio.get_running_loop()
-            for img_path in all_local:
-                style_path = await loop.run_in_executor(
-                    None, self.styler.adapt, img_path, output_dir, product.title_en
-                )
-                processed.append(style_path)
-
-            if processed:
-                # Preserve original URLs alongside processed local paths for re-processing
-                existing_urls = {str(u) for u in (product.images if isinstance(product.images, list) else []) if str(u).startswith("http")}
-                processed_paths = {str(p) for p in processed}
-                product.images = list(existing_urls | processed_paths)
+            if local_images or local_sku:
+                product.images = local_images + local_sku
             product.status = PipelineStatus.PROCESSED
 
-            logger.info(f"Processed: {len(processed)} images | desc: {len(product.optimized_description)} chars")
+            logger.info(f"Processed: {len(product.images)} images | desc: {len(product.optimized_description)} chars")
             return StageResult.ok(product)
 
         except Exception as exc:
