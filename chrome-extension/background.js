@@ -38,4 +38,34 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     });
     return true;
   }
+
+  if (msg.action === 'start_server') {
+    chrome.runtime.sendNativeMessage(
+      'com.product_sourcing.server_launcher',
+      { action: 'start_server', port: msg.port || 0 },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          sendResponse({ ok: false, error: chrome.runtime.lastError.message });
+        } else {
+          sendResponse(response);
+        }
+      }
+    );
+    return true;
+  }
+
+  if (msg.action === 'get_port') {
+    chrome.runtime.sendNativeMessage(
+      'com.product_sourcing.server_launcher',
+      { action: 'get_port' },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          sendResponse({ ok: false, error: chrome.runtime.lastError.message });
+        } else {
+          sendResponse(response);
+        }
+      }
+    );
+    return true;
+  }
 });

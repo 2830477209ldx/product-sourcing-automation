@@ -14,11 +14,8 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-import socket
 import sys
 from pathlib import Path
-
-import httpx
 
 if sys.stdout:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -32,122 +29,7 @@ import click
 from loguru import logger
 
 from src.config import Config
-
-IMAGE_DIR = Path("data/images")
-
-
-async def _download_images(folder: str, urls: list[str], name_prefix: str = "") -> list[str]:
-    """Download images to data/images/{folder}/ and return local paths.
-
-    If name_prefix is given, files are named {name_prefix}_{01}.{ext};
-    otherwise {000}.{ext}.
-    """
-    import ipaddress
-
-    if not urls:
-        return []
-    img_dir = IMAGE_DIR / folder
-    img_dir.mkdir(parents=True, exist_ok=True)
-    local_paths: list[str] = []
-
-    for i, url in enumerate(urls):
-        if not url.startswith("http"):
-            continue
-        try:
-            parsed = httpx.URL(url)
-            host = parsed.host
-            if not host:
-                continue
-            # Block private IPs
-            try:
-                addr = socket.getaddrinfo(host, None)[0][4][0]
-                ip = ipaddress.ip_address(addr)
-                if ip.is_private or ip.is_loopback or ip.is_reserved or ip.is_multicast:
-                    continue
-            except (socket.gaierror, ValueError):
-                continue
-
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.get(url, follow_redirects=True)
-                resp.raise_for_status()
-                content_type = resp.headers.get("content-type", "")
-                if not content_type.startswith("image/"):
-                    continue
-                content = await resp.aread()
-                if len(content) > 20 * 1024 * 1024:
-                    continue
-
-            ext = url.rsplit(".", 1)[-1].split("?")[0] or "jpg"
-            if ext.lower() not in ("jpg", "jpeg", "png", "webp", "gif", "bmp"):
-                ext = "jpg"
-            if name_prefix:
-                local_path = img_dir / f"{name_prefix}_{i+1:02d}.{ext}"
-            else:
-                local_path = img_dir / f"{i:03d}.{ext}"
-            local_path.write_bytes(content)
-            local_paths.append(str(local_path))
-        except Exception:
-            pass
-
-    click.echo(f"  Downloaded {len(local_paths)}/{len(urls)} images")
-    return local_paths
-
-
-async def _download_sku_images(folder: str, sku_prices: list[dict]) -> list[str]:
-    """Download SKU-specific images, naming them by SKU name."""
-    import ipaddress
-
-    if not sku_prices:
-        return []
-    img_dir = IMAGE_DIR / folder
-    img_dir.mkdir(parents=True, exist_ok=True)
-    local_paths: list[str] = []
-
-    for sku in sku_prices:
-        raw_name = sku.get("name", "sku")
-        sku_name = re.sub(r"[^\w\s\-.]", "", str(raw_name))
-        sku_name = re.sub(r"\s+", "-", sku_name).strip("-.") or "sku"
-        sku_images = sku.get("images", [])
-        for j, url in enumerate(sku_images):
-            if not isinstance(url, str) or not url.startswith("http"):
-                continue
-            try:
-                parsed = httpx.URL(url)
-                host = parsed.host
-                if not host:
-                    continue
-                try:
-                    addr = socket.getaddrinfo(host, None)[0][4][0]
-                    ip = ipaddress.ip_address(addr)
-                    if ip.is_private or ip.is_loopback or ip.is_reserved or ip.is_multicast:
-                        continue
-                except (socket.gaierror, ValueError):
-                    continue
-
-                async with httpx.AsyncClient(timeout=30) as client:
-                    resp = await client.get(url, follow_redirects=True)
-                    resp.raise_for_status()
-                    content_type = resp.headers.get("content-type", "")
-                    if not content_type.startswith("image/"):
-                        continue
-                    content = await resp.aread()
-                    if len(content) > 20 * 1024 * 1024:
-                        continue
-
-                ext = url.rsplit(".", 1)[-1].split("?")[0] or "jpg"
-                if ext.lower() not in ("jpg", "jpeg", "png", "webp", "gif", "bmp"):
-                    ext = "jpg"
-                if len(sku_images) <= 1:
-                    local_path = img_dir / f"{sku_name}.{ext}"
-                else:
-                    local_path = img_dir / f"{sku_name}_{j+1:02d}.{ext}"
-                local_path.write_bytes(content)
-                local_paths.append(str(local_path))
-            except Exception:
-                pass
-
-    click.echo(f"  Downloaded {len(local_paths)} SKU images")
-    return local_paths
+from src.downloader import download_images, download_sku_images
 
 
 def _make_pipeline(headless: bool = True):
@@ -230,9 +112,9 @@ def add_interactive(url: str):
         handle = data.get("title_cn", "") or product_id
         handle = re.sub(r"[^a-z0-9]+", "-", handle.lower()).strip("-") or product_id
         handle = handle[:60]
-        local_images = await _download_images(handle, data.get("image_urls", []), handle)
-        local_desc = await _download_images(handle, data.get("desc_images", []), f"{handle}_desc")
-        local_sku = await _download_sku_images(handle, data.get("sku_prices", []))
+        local_images = await download_images(handle, data.get("image_urls", []), handle)
+        local_desc = await download_images(handle, data.get("desc_images", []), f"{handle}_desc")
+        local_sku = await download_sku_images(handle, data.get("sku_prices", []))
 
         # ── Step 2: Save to DB ──
         platform_str = detect_platform(data.get("source_url", url))
@@ -329,9 +211,9 @@ def batch_add_interactive(url: tuple, file: str):
             handle = data.get("title_cn", "") or product_id
             handle = re.sub(r"[^a-z0-9]+", "-", handle.lower()).strip("-") or product_id
             handle = handle[:60]
-            local_images = await _download_images(handle, data.get("image_urls", []), handle)
-            local_desc = await _download_images(handle, data.get("desc_images", []), f"{handle}_desc")
-            local_sku = await _download_sku_images(handle, data.get("sku_prices", []))
+            local_images = await download_images(handle, data.get("image_urls", []), handle)
+            local_desc = await download_images(handle, data.get("desc_images", []), f"{handle}_desc")
+            local_sku = await download_sku_images(handle, data.get("sku_prices", []))
 
             # Save to DB
             platform_str = detect_platform(url)
@@ -376,7 +258,7 @@ def batch_add_interactive(url: tuple, file: str):
 
         click.echo(f"\n{'=' * 50}")
         click.echo(f"BATCH COMPLETE: {ok_count}/{len(urls)} succeeded")
-        click.echo(f"Data file: data/products.db")
+        click.echo("Data file: data/products.db")
         await agent.close()
         await repo.close()
 
@@ -417,13 +299,11 @@ def export():
 
 @cli.command()
 @click.option("--host", default="127.0.0.1", help="API server host")
-@click.option("--port", default=8765, help="API server port")
+@click.option("--port", default=0, help="API server port (0=auto)")
 def api(host: str, port: int):
     """Start API server for Chrome extension integration."""
     from src.api.server import run
 
-    click.echo(f"Starting API server on http://{host}:{port}")
-    click.echo("Chrome extension will connect to this endpoint.")
     run(host=host, port=port)
 
 

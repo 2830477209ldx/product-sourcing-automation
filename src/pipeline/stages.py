@@ -15,64 +15,10 @@ from src.models.product import MarketScore, PipelineStatus, Platform, Product
 from src.pipeline import StageResult
 from src.processing.image_styler import ImageStyler
 from src.shopify.csv_exporter import CSVExporter
-from src.utils import clean_price, detect_platform, make_handle_from_title, sanitize_filename
+from src.utils import clean_price, detect_platform
+from src.downloader import download_images, download_sku_images
+from src.prompts import DESCRIPTION_BUILD_PROMPT, MARKET_ANALYZE_PROMPT, STRUCTURED_EXTRACT_PROMPT
 
-
-# ── Prompt templates ────────────────────────────────────────
-
-STRUCTURED_EXTRACT_PROMPT = """You are a product data extraction expert. Given raw page text from a Chinese e-commerce product page, extract structured data in English for a US Shopify listing.
-
-Extract these fields:
-1. title_en: Clean English product title (max 70 chars, SEO-optimized)
-2. description_en: HTML formatted product description with bullet points (<ul><li>...)
-3. material: Product material
-4. dimensions: Dimensions converted to inches
-5. weight_oz: Weight in ounces
-6. color_options: Available colors in English
-7. size_options: Available sizes
-8. features: List of 5-7 key product features/benefits in English
-9. price_cn: Original price as shown on the page
-10. suggested_price_usd: Suggested US retail price (CN price / 7.2, add reasonable margin)
-11. category: Best Shopify product category
-12. tags: 5-8 SEO tags for Shopify
-
-Actual scraped SKU variants (for context, do NOT output sku_prices):
-{sku_prices}
-
-Page content:
-{page_text}
-
-Return ONLY a JSON object with all these fields."""
-
-MARKET_ANALYZE_PROMPT = """You are a cross-border e-commerce analyst. Evaluate this product's US market potential.
-
-Product:
-{product_info}
-
-Score each dimension 0-100 and compute weighted total:
-1. Visual Appeal (25%): Western consumer aesthetic appeal
-2. Category Demand (25%): US market demand for this category
-3. Uniqueness (20%): Differentiation vs US competitors
-4. Price Arbitrage (15%): Margin potential
-5. Trend Alignment (15%): Current US market trends
-
-Return ONLY a JSON object:
-{{"total": N, "visual_appeal": N, "category_demand": N, "uniqueness": N, "price_arbitrage": N, "trend_alignment": N, "reasoning": "...", "target_audience": "...", "suggested_price_usd": "...", "competitive_notes": "..."}}"""
-
-DESCRIPTION_BUILD_PROMPT = """You are an expert Shopify copywriter. Generate an SEO-optimized HTML product description.
-
-Product: {title_en}
-Details: {description_en}
-Target keywords: {tags}
-
-Generate a complete Shopify product description:
-1. Start with a compelling headline (h2)
-2. 3-5 bullet points of key features/benefits (ul > li)
-3. Persuasive closing paragraph with call-to-action (p)
-4. SEO meta description (under 160 chars)
-
-Return ONLY a JSON object:
-{{"description_html": "<h2>...</h2><ul>...</ul><p>...</p>", "seo_title": "...", "seo_description": "...", "suggested_tags": ["tag1", "tag2"]}}"""
 
 # ── Stages ──────────────────────────────────────────────────
 
@@ -126,7 +72,10 @@ class ExtractStage:
         try:
             prompt = STRUCTURED_EXTRACT_PROMPT.format(
                 page_text=product.description_cn[:10000],
-                sku_prices=json.dumps(product.sku_prices[:20], ensure_ascii=False) if product.sku_prices else "none",
+                sku_prices=json.dumps(
+                    product.sku_prices[:20] if isinstance(product.sku_prices, list) else [],
+                    ensure_ascii=False,
+                ) if product.sku_prices else "none",
             )
             result = await self.llm.chat_json(
                 [{"role": "user", "content": prompt}],
@@ -139,7 +88,9 @@ class ExtractStage:
             product.title_en = result.get("title_en") or product.title_en or product.title_cn
             product.description_en = result.get("description_en") or product.description_en or product.description_cn[:500]
             product.price_cn = result.get("price_cn") or product.price_cn
-            product.price_usd = clean_price(result.get("suggested_price_usd", 0)) or product.price_usd
+            suggested = result.get("suggested_price_usd")
+            if suggested is not None and str(suggested).strip() != "":
+                product.price_usd = clean_price(suggested)
             product.tags = result.get("tags") or product.tags
 
             logger.info(f"Extracted: {product.title_en[:50]} | ${product.price_usd} | {len(product.tags)} tags")
@@ -220,8 +171,9 @@ class ProcessStage:
                 product.tags = desc.get("suggested_tags", product.tags)
 
             # Download and process images (run sync styler in thread pool)
-            local_images = await self._download_images(product)
-            local_sku = await self._download_sku_images(product)
+            handle = product.make_handle()
+            local_images = await download_images(handle, product.images[:10], handle)
+            local_sku = await download_sku_images(handle, product.sku_prices)
             all_local = local_images + local_sku
             output_dir = Path("data/processed") / product.make_handle()
             processed = []
@@ -232,7 +184,11 @@ class ProcessStage:
                 )
                 processed.append(style_path)
 
-            product.images = [str(p) for p in processed] if processed else product.images
+            if processed:
+                # Preserve original URLs alongside processed local paths for re-processing
+                existing_urls = {str(u) for u in (product.images if isinstance(product.images, list) else []) if str(u).startswith("http")}
+                processed_paths = {str(p) for p in processed}
+                product.images = list(existing_urls | processed_paths)
             product.status = PipelineStatus.PROCESSED
 
             logger.info(f"Processed: {len(processed)} images | desc: {len(product.optimized_description)} chars")
@@ -241,119 +197,6 @@ class ProcessStage:
         except Exception as exc:
             logger.error(f"Process failed: {exc}")
             return StageResult.fail(str(exc), product)
-
-    async def _download_images(self, product: Product) -> list[Path]:
-        import ipaddress
-        import socket
-
-        import httpx
-
-        handle = product.make_handle()
-        img_dir = Path("data/images") / handle
-        img_dir.mkdir(parents=True, exist_ok=True)
-        paths: list[Path] = []
-
-        for i, url in enumerate(product.images[:10]):
-            if not url.startswith("http"):
-                continue
-            try:
-                parsed = httpx.URL(url)
-                host = parsed.host
-                if not host:
-                    continue
-
-                try:
-                    addr = socket.getaddrinfo(host, None)[0][4][0]
-                    ip = ipaddress.ip_address(addr)
-                    if ip.is_private or ip.is_loopback or ip.is_reserved or ip.is_multicast:
-                        logger.warning(f"Blocked private/internal URL: {url}")
-                        continue
-                except (socket.gaierror, ValueError):
-                    continue
-
-                async with httpx.AsyncClient(timeout=30) as client:
-                    resp = await client.get(url, follow_redirects=True)
-                    resp.raise_for_status()
-
-                    content_type = resp.headers.get("content-type", "")
-                    if not content_type.startswith("image/"):
-                        logger.warning(f"Skip non-image URL (content-type={content_type}): {url}")
-                        continue
-
-                    content = await resp.aread()
-                    if len(content) > 20 * 1024 * 1024:
-                        logger.warning(f"Skip oversized image ({len(content)} bytes): {url}")
-                        continue
-
-                    ext = url.rsplit(".", 1)[-1].split("?")[0] or "jpg"
-                    if ext.lower() not in ("jpg", "jpeg", "png", "webp", "gif", "bmp"):
-                        ext = "jpg"
-                    local_path = img_dir / f"{handle}_{i+1:02d}.{ext}"
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(None, local_path.write_bytes, content)
-                    paths.append(local_path)
-            except Exception as exc:
-                logger.debug(f"Skip image {i}: {exc}")
-
-        return paths
-
-    async def _download_sku_images(self, product: Product) -> list[Path]:
-        import ipaddress
-        import socket
-
-        import httpx
-
-        handle = product.make_handle()
-        img_dir = Path("data/images") / handle
-        img_dir.mkdir(parents=True, exist_ok=True)
-        paths: list[Path] = []
-
-        for sku in product.sku_prices:
-            sku_name = sanitize_filename(sku.get("name", "sku"))
-            sku_images = sku.get("images", [])
-            for j, url in enumerate(sku_images):
-                if not isinstance(url, str) or not url.startswith("http"):
-                    continue
-                try:
-                    parsed = httpx.URL(url)
-                    host = parsed.host
-                    if not host:
-                        continue
-
-                    try:
-                        addr = socket.getaddrinfo(host, None)[0][4][0]
-                        ip = ipaddress.ip_address(addr)
-                        if ip.is_private or ip.is_loopback or ip.is_reserved or ip.is_multicast:
-                            continue
-                    except (socket.gaierror, ValueError):
-                        continue
-
-                    async with httpx.AsyncClient(timeout=30) as client:
-                        resp = await client.get(url, follow_redirects=True)
-                        resp.raise_for_status()
-
-                        content_type = resp.headers.get("content-type", "")
-                        if not content_type.startswith("image/"):
-                            continue
-
-                        content = await resp.aread()
-                        if len(content) > 20 * 1024 * 1024:
-                            continue
-
-                        ext = url.rsplit(".", 1)[-1].split("?")[0] or "jpg"
-                        if ext.lower() not in ("jpg", "jpeg", "png", "webp", "gif", "bmp"):
-                            ext = "jpg"
-                        if len(sku_images) <= 1:
-                            local_path = img_dir / f"{sku_name}.{ext}"
-                        else:
-                            local_path = img_dir / f"{sku_name}_{j+1:02d}.{ext}"
-                        loop = asyncio.get_running_loop()
-                        await loop.run_in_executor(None, local_path.write_bytes, content)
-                        paths.append(local_path)
-                except Exception as exc:
-                    logger.debug(f"Skip SKU image {sku_name}[{j}]: {exc}")
-
-        return paths
 
 
 class PublishStage:

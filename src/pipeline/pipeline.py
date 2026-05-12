@@ -44,24 +44,30 @@ class Pipeline:
     async def import_from_url(self, url: str) -> StageResult[Product]:
         """Full pipeline from a single URL:
         Load → Extract → Analyze → Process → Save.
+        Persists after each stage so partial data is never lost on failure.
         """
         r = await self.load_stage.run(url)
         if r.failed or not r.data:
             return r
-
-        r = await self.extract_stage.run(r.data)
-        if r.failed or not r.data:
-            return r
-
-        r = await self.analyze_stage.run(r.data)
-        if r.failed or not r.data:
-            return r
-
         product = r.data
+        await self.repo.save(product)
+
+        r = await self.extract_stage.run(product)
+        if r.failed or not r.data:
+            return StageResult.fail(r.error, product)
+        product = r.data
+        await self.repo.save(product)
+
+        r = await self.analyze_stage.run(product)
+        if r.failed or not r.data:
+            return StageResult.fail(r.error, product)
+        product = r.data
+        await self.repo.save(product)
+
         if product.status == PipelineStatus.ANALYZED:
             r = await self.process_stage.run(product)
             if r.failed or not r.data:
-                return r
+                return StageResult.fail(r.error, product)
             product = r.data
 
         product.status = PipelineStatus.REVIEW_PENDING

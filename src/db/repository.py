@@ -57,10 +57,10 @@ class ProductRepository:
             )
         """)
         # Add desc_images column if missing (migration for existing DBs)
-        try:
+        cursor = await conn.execute("PRAGMA table_info(products)")
+        columns = [row["name"] async for row in cursor]
+        if "desc_images" not in columns:
             await conn.execute("ALTER TABLE products ADD COLUMN desc_images TEXT DEFAULT '[]'")
-        except Exception:
-            pass
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON products(status)")
         await conn.commit()
 
@@ -113,6 +113,14 @@ class ProductRepository:
         rows = await cursor.fetchall()
         return [self._row_to_product(r) for r in rows]
 
+    async def list_recent(self, limit: int = 10) -> list[Product]:
+        conn = await self._get_conn()
+        cursor = await conn.execute(
+            "SELECT * FROM products ORDER BY updated_at DESC LIMIT ?", (limit,)
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_product(r) for r in rows]
+
     async def count_by_status(self, status: PipelineStatus) -> int:
         conn = await self._get_conn()
         row = await conn.execute("SELECT COUNT(*) FROM products WHERE status = ?", (status.value,))
@@ -134,8 +142,4 @@ class ProductRepository:
         score = d.get("market_score", "{}")
         d["market_score"] = json.loads(score) if isinstance(score, str) else score
         d["status"] = d.get("status", "scraped")
-        # Clean price_usd: normalize prefixed strings like "$18.99"
-        price = d.get("price_usd")
-        if isinstance(price, str):
-            d["price_usd"] = price.strip().replace("$", "").replace(",", "")
         return Product(**d)

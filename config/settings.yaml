@@ -3,11 +3,11 @@
 # ── AI / LLM ──────────────────────────────────────────
 ai:
   # Choose provider: deepseek | gemini
-  provider: gemini
-  api_key: "${GEMINI_API_KEY}"
-  base_url: "https://generativelanguage.googleapis.com/v1beta/openai/"
-  model_text: "gemini-2.5-flash"
-  model_vision: "gemini-2.5-flash"
+  provider: deepseek
+  api_key: "${DEEPSEEK_API_KEY}"
+  base_url: "https://api.deepseek.com"
+  model_text: "deepseek-chat"
+  model_vision: "deepseek-chat"
   temperature: 0.3
 
 # ── Market Analysis ───────────────────────────────────

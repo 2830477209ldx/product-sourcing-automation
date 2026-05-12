@@ -37,11 +37,8 @@ class LLMService:
 
         if provider == "gemini":
             from openai import DefaultHttpxClient
-            import httpx
             httpx_client = DefaultHttpxClient(
-                transport=httpx.HTTPTransport(
-                    headers={"x-goog-api-key": api_key},
-                )
+                headers={"x-goog-api-key": api_key},
             )
             self._client = AsyncOpenAI(
                 api_key="dummy",

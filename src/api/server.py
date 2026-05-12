@@ -1,13 +1,13 @@
 """FastAPI server — receives page data from Chrome extension and runs pipeline."""
 from __future__ import annotations
 
-import asyncio
 import re
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from loguru import logger
 from pydantic import BaseModel
 
@@ -15,16 +15,29 @@ from src.config import Config
 from src.db.repository import ProductRepository
 from src.llm.service import LLMService
 from src.models.product import MarketScore, PipelineStatus, Platform, Product
-from src.utils import detect_platform
+from src.utils import detect_platform, clean_price
+from src.downloader import download_images, download_sku_images
+from src.prompts import MARKET_ANALYZE_PROMPT, STRUCTURED_EXTRACT_PROMPT
+from src.api.ai_agent import agent_step
 
 app = FastAPI(title="Product Sourcing API")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_origin_regex=r".*",
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    logger.info(f">>> {request.method} {request.url.path} from {request.client.host if request.client else '?'}")
+    response = await call_next(request)
+    logger.info(f"<<< {request.method} {request.url.path} → {response.status_code}")
+    return response
 
 
 class PageData(BaseModel):
@@ -36,161 +49,6 @@ class PageData(BaseModel):
     desc_images: list[str] = []
     sku_prices: list[dict] = []
     description_cn: str = ""
-
-
-# ── LLM prompts (reused from pipeline stages) ──
-
-STRUCTURED_EXTRACT_PROMPT = """You are a product data extraction expert. Given raw page text from a Chinese e-commerce product page, extract structured data in English for a US Shopify listing.
-
-Extract these fields:
-1. title_en: Clean English product title (max 70 chars, SEO-optimized)
-2. description_en: HTML formatted product description with bullet points (<ul><li>...)
-3. material: Product material
-4. dimensions: Dimensions converted to inches
-5. weight_oz: Weight in ounces
-6. color_options: Available colors in English
-7. size_options: Available sizes
-8. features: List of 5-7 key product features/benefits in English
-9. price_cn: Original price as shown on the page
-10. suggested_price_usd: Suggested US retail price (CN price / 7.2, add reasonable margin)
-11. category: Best Shopify product category
-12. tags: 5-8 SEO tags for Shopify
-
-Actual scraped SKU variants (for context, do NOT output sku_prices):
-{sku_prices}
-
-Page content:
-{page_text}
-
-Return ONLY a JSON object with all these fields."""
-
-MARKET_ANALYZE_PROMPT = """You are a cross-border e-commerce analyst. Evaluate this product's US market potential.
-
-Product:
-{product_info}
-
-Score each dimension 0-100 and compute weighted total:
-1. Visual Appeal (25%): Western consumer aesthetic appeal
-2. Category Demand (25%): US market demand for this category
-3. Uniqueness (20%): Differentiation vs US competitors
-4. Price Arbitrage (15%): Margin potential
-5. Trend Alignment (15%): Current US market trends
-
-Return ONLY a JSON object:
-{{"total": N, "visual_appeal": N, "category_demand": N, "uniqueness": N, "price_arbitrage": N, "trend_alignment": N, "reasoning": "...", "target_audience": "...", "suggested_price_usd": "...", "competitive_notes": "..."}}"""
-
-
-async def _download_images(folder: str, urls: list[str], name_prefix: str = "") -> list[str]:
-    """Download images to data/images/{folder}/ and return local paths."""
-    import ipaddress
-    import socket
-
-    import httpx
-
-    if not urls:
-        return []
-    img_dir = Path("data/images") / folder
-    img_dir.mkdir(parents=True, exist_ok=True)
-    local_paths: list[str] = []
-
-    for i, url in enumerate(urls):
-        if not url.startswith("http"):
-            continue
-        try:
-            parsed = httpx.URL(url)
-            host = parsed.host
-            if not host:
-                continue
-            try:
-                addr = socket.getaddrinfo(host, None)[0][4][0]
-                ip = ipaddress.ip_address(addr)
-                if ip.is_private or ip.is_loopback or ip.is_reserved or ip.is_multicast:
-                    continue
-            except (socket.gaierror, ValueError):
-                continue
-
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.get(url, follow_redirects=True)
-                resp.raise_for_status()
-                content_type = resp.headers.get("content-type", "")
-                if not content_type.startswith("image/"):
-                    continue
-                content = await resp.aread()
-                if len(content) > 20 * 1024 * 1024:
-                    continue
-
-            ext = url.rsplit(".", 1)[-1].split("?")[0] or "jpg"
-            if ext.lower() not in ("jpg", "jpeg", "png", "webp", "gif", "bmp"):
-                ext = "jpg"
-            if name_prefix:
-                local_path = img_dir / f"{name_prefix}_{i+1:02d}.{ext}"
-            else:
-                local_path = img_dir / f"{i:03d}.{ext}"
-            local_path.write_bytes(content)
-            local_paths.append(str(local_path))
-        except Exception:
-            pass
-
-    logger.info(f"  Downloaded {len(local_paths)}/{len(urls)} images")
-    return local_paths
-
-
-async def _download_sku_images(folder: str, sku_prices: list[dict]) -> list[str]:
-    """Download SKU-specific images."""
-    import ipaddress
-    import socket
-
-    import httpx
-
-    if not sku_prices:
-        return []
-    img_dir = Path("data/images") / folder
-    img_dir.mkdir(parents=True, exist_ok=True)
-    local_paths: list[str] = []
-
-    for sku in sku_prices:
-        raw_name = sku.get("name", "sku")
-        sku_name = re.sub(r"[^\w\s\-.]", "", str(raw_name))
-        sku_name = re.sub(r"\s+", "-", sku_name).strip("-.") or "sku"
-        for j, url in enumerate(sku.get("images", [])):
-            if not isinstance(url, str) or not url.startswith("http"):
-                continue
-            try:
-                parsed = httpx.URL(url)
-                host = parsed.host
-                if not host:
-                    continue
-                try:
-                    addr = socket.getaddrinfo(host, None)[0][4][0]
-                    ip = ipaddress.ip_address(addr)
-                    if ip.is_private or ip.is_loopback or ip.is_reserved or ip.is_multicast:
-                        continue
-                except (socket.gaierror, ValueError):
-                    continue
-
-                async with httpx.AsyncClient(timeout=30) as client:
-                    resp = await client.get(url, follow_redirects=True)
-                    resp.raise_for_status()
-                    content_type = resp.headers.get("content-type", "")
-                    if not content_type.startswith("image/"):
-                        continue
-                    content = await resp.aread()
-                    if len(content) > 20 * 1024 * 1024:
-                        continue
-
-                ext = url.rsplit(".", 1)[-1].split("?")[0] or "jpg"
-                if ext.lower() not in ("jpg", "jpeg", "png", "webp", "gif", "bmp"):
-                    ext = "jpg"
-                if len(sku.get("images", [])) <= 1:
-                    local_path = img_dir / f"{sku_name}.{ext}"
-                else:
-                    local_path = img_dir / f"{sku_name}_{j+1:02d}.{ext}"
-                local_path.write_bytes(content)
-                local_paths.append(str(local_path))
-            except Exception:
-                pass
-
-    return local_paths
 
 
 # ── Lazy-init singletons ──
@@ -224,9 +82,40 @@ def _get_repo() -> ProductRepository:
 # ── API Routes ──
 
 
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"ok": False, "error": str(exc)[:500]},
+    )
+
+
 @app.get("/api/health")
 async def health():
     return {"status": "ok", "db": str(Path("data/products.db").exists())}
+
+
+class AgentStepRequest(BaseModel):
+    platform: str = ""
+    round: int = 0
+    dom: dict = {}
+    history: list[dict] = []
+    debug: bool = False
+
+
+@app.post("/api/ai-agent/step")
+async def ai_agent_step(req: AgentStepRequest):
+    llm = _get_llm()
+    result = await agent_step(
+        llm=llm,
+        platform=req.platform or "unknown",
+        round_num=req.round,
+        dom_state=req.dom,
+        history=req.history,
+        debug=req.debug,
+    )
+    return result
 
 
 @app.post("/api/import")
@@ -248,9 +137,9 @@ async def import_product(data: PageData):
     handle = re.sub(r"[^a-z0-9]+", "-", handle.lower()).strip("-") or product_id
     handle = handle[:60]
 
-    local_images = await _download_images(handle, data.image_urls, handle)
-    local_desc = await _download_images(handle, data.desc_images, f"{handle}_desc")
-    local_sku = await _download_sku_images(handle, data.sku_prices)
+    local_images = await download_images(handle, data.image_urls, handle)
+    local_desc = await download_images(handle, data.desc_images, f"{handle}_desc")
+    local_sku = await download_sku_images(handle, data.sku_prices)
 
     # ── 3. Build Product ──
     product = Product(
@@ -275,9 +164,10 @@ async def import_product(data: PageData):
     try:
         prompt = STRUCTURED_EXTRACT_PROMPT.format(
             page_text=product.description_cn[:10000],
-            sku_prices=_json.dumps(product.sku_prices[:20], ensure_ascii=False)
-            if product.sku_prices
-            else "none",
+            sku_prices=_json.dumps(
+                product.sku_prices[:20] if isinstance(product.sku_prices, list) else [],
+                ensure_ascii=False,
+            ) if product.sku_prices else "none",
         )
         extract_result = await llm.chat_json(
             [{"role": "user", "content": prompt}],
@@ -290,10 +180,10 @@ async def import_product(data: PageData):
             product.price_cn = extract_result.get("price_cn") or product.price_cn
             product.tags = extract_result.get("tags") or []
             # Parse suggested price
-            price_raw = extract_result.get("suggested_price_usd", 0)
-            if price_raw:
+            price_raw = extract_result.get("suggested_price_usd")
+            if price_raw is not None:
                 try:
-                    product.price_usd = float(str(price_raw).replace("$", "").replace(",", ""))
+                    product.price_usd = clean_price(price_raw)
                 except (ValueError, TypeError):
                     pass
             logger.info(f"  LLM extract: {product.title_en[:50]} | ${product.price_usd}")
@@ -373,8 +263,7 @@ async def get_product(product_id: str):
 async def recent_imports(limit: int = 10):
     """List recently imported products."""
     repo = _get_repo()
-    products = await repo.list_all()
-    recent = products[:limit]
+    recent = await repo.list_recent(limit)
     return {
         "ok": True,
         "count": len(recent),
@@ -394,9 +283,37 @@ async def recent_imports(limit: int = 10):
     }
 
 
-def run(host: str = "127.0.0.1", port: int = 8765):
-    """Start the API server."""
-    import uvicorn
+def _find_available_port(host: str, start: int = 8765, tries: int = 20) -> int:
+    import socket
+    for p in range(start, start + tries):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind((host, p))
+                return p
+            except OSError:
+                continue
+    return start
 
-    logger.info(f"Starting Product Sourcing API on {host}:{port}")
+
+def _write_port_file(port: int):
+    port_file = Path("data") / "api_port.txt"
+    port_file.parent.mkdir(parents=True, exist_ok=True)
+    port_file.write_text(str(port))
+
+
+@app.on_event("startup")
+async def _on_startup():
+    pass
+
+
+def run(host: str = "127.0.0.1", port: int = 0):
+    """Start the API server. port=0 means auto-find available port."""
+    import uvicorn
+    import socket
+
+    if port == 0:
+        port = _find_available_port(host)
+
+    _write_port_file(port)
+    logger.info(f"Starting Product Sourcing API on {host}:{port} (written to data/api_port.txt)")
     uvicorn.run("src.api.server:app", host=host, port=port, log_level="info")

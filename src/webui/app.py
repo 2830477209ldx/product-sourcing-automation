@@ -186,7 +186,7 @@ if not products:
 
 # ── Product cards ────────────────────────────────────────────
 for idx, product in enumerate(products):
-    imgs = [img for img in product.images if img and Path(img).exists()]
+    imgs = [img for img in product.images if img and (img.startswith(("http://", "https://")) or Path(img).exists())]
     skus = product.sku_prices if isinstance(product.sku_prices, list) else []
     pid = product.id or f"p{idx}"
     handle = product.make_handle()
@@ -341,7 +341,7 @@ for idx, product in enumerate(products):
 
         # ── Detail Images ──
         if product.desc_images:
-            desc_imgs_exist = [img for img in product.desc_images if img and Path(img).exists()]
+            desc_imgs_exist = [img for img in product.desc_images if img and (img.startswith(("http://", "https://")) or Path(img).exists())]
             if desc_imgs_exist:
                 st.markdown("---")
                 st.markdown('<span class="section-title">🖼️ 图文详情</span>', unsafe_allow_html=True)
@@ -443,11 +443,12 @@ for idx, product in enumerate(products):
                 st.markdown('<span class="section-title">📷 Image Processing Cards</span>', unsafe_allow_html=True)
                 st.caption("Each image has its own prompt. Process individually or batch all.")
 
-                select_all = st.checkbox("Select All", value=True, key=f"{PP}_all")
                 cur_sel = st.session_state[f"{PP}_selected"]
-                if select_all:
+                all_selected = len(cur_sel) == len(image_paths)
+                select_all = st.checkbox("Select All", value=all_selected, key=f"{PP}_all")
+                if select_all and not all_selected:
                     cur_sel = set(range(len(image_paths)))
-                else:
+                elif not select_all and all_selected:
                     cur_sel = set()
                 st.session_state[f"{PP}_selected"] = cur_sel
 

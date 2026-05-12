@@ -1,9 +1,9 @@
 /**
- * Product Sourcing Importer — Content Script
+ * Product Sourcing Importer — AI-Driven Content Script
  *
- * Injected into supported e-commerce product pages.
- * Collects raw page data when the extension popup requests it.
- * Strategy: platform-specific selectors → layout-based fallback → API interception.
+ * Instead of hardcoded CSS selectors, this agent sends DOM snapshots
+ * to the backend LLM, which decides what to click/scroll/read.
+ * The script is a "dumb executor" — AI tells it what to do.
  */
 (function () {
   'use strict';
@@ -14,9 +14,8 @@
 
   function detectPlatform(url) {
     url = url || window.location.href;
-    if (/taobao\.com|tmall\.com/i.test(url)) {
-      return /tmall\.com/i.test(url) ? 'tmall' : 'taobao';
-    }
+    if (/tmall\.com/i.test(url)) return 'tmall';
+    if (/taobao\.com/i.test(url)) return 'taobao';
     if (/1688\.com/i.test(url)) return 'alibaba';
     if (/aliexpress/i.test(url)) return 'aliexpress';
     if (/xiaohongshu\.com/i.test(url)) return 'xiaohongshu';
@@ -24,26 +23,8 @@
   }
 
   // ═══════════════════════════════════════
-  // 2. Image URL helpers
+  // 2. DOM Snapshot Builder
   // ═══════════════════════════════════════
-
-  const SKIP_PATTERNS = [
-    'icon', 'logo', 'avatar', 'banner', 'qr_code', 'qrcode',
-    'loading', 'pixel', 'track', 'beacon', '1x1',
-    'btn', 'button', 'arrow', 'back_top', 'backtop',
-    'share', 'collect', 'cart', 'evaluate', 'rating',
-    'star', 'crown', 'medal', 'badge',
-    'gotop', 'gototop', 'upup', 'erweima'
-  ];
-
-  function isProductImage(url) {
-    if (!url) return false;
-    const low = url.toLowerCase();
-    for (const p of SKIP_PATTERNS) {
-      if (low.indexOf(p) !== -1) return false;
-    }
-    return true;
-  }
 
   function normalizeUrl(url) {
     if (!url) return '';
@@ -52,479 +33,397 @@
     return url.replace(/_\d+x\d+\./g, '.').split('?')[0];
   }
 
-  function dedupeUrls(urls) {
-    const seen = new Set();
-    return urls.filter(u => {
-      const n = normalizeUrl(u);
-      if (!n || seen.has(n)) return false;
-      seen.add(n);
-      return true;
-    }).map(normalizeUrl);
+  function isProductImage(url) {
+    if (!url) return false;
+    var skipWords = ['icon','logo','avatar','banner','qrcode','loading','pixel','track','beacon',
+      'btn','button','arrow','back_top','share','collect','cart','star','crown','medal','badge',
+      'gotop','upup','erweima','evaluate','rating'];
+    var low = url.toLowerCase();
+    for (var i = 0; i < skipWords.length; i++) {
+      if (low.indexOf(skipWords[i]) !== -1) return false;
+    }
+    return true;
   }
 
-  // ═══════════════════════════════════════
-  // 3. Platform-specific extractors (primary)
-  // ═══════════════════════════════════════
+  function buildDomOutline(node, maxDepth, maxChildren) {
+    if (maxDepth === undefined) maxDepth = 3;
+    if (maxChildren === undefined) maxChildren = 15;
+    if (!node || node.nodeType !== 1) return null;
 
-  function extractTaobaoTitle() {
-    // Try known title selectors
-    const sel = [
-      '.tb-main-title', 'h1[data-spm="1000983"]', '.ItemTitle--mainTitle--',
-      '[class*="ItemTitle"] h1', '.slogan', 'h3.tb-main-title',
-      'h1[data-spm-anchor-id]',
-    ];
-    for (const s of sel) {
-      const el = document.querySelector(s);
-      if (el) {
-        const t = el.textContent.trim();
-        if (t.length > 2) {
-          // Clean: remove "淘宝" prefix, spaces, newlines, emoji
-          return t.replace(/[\s\n]+/g, ' ').replace(/^淘宝\s*/, '').slice(0, 200);
-        }
+    var tag = node.tagName.toLowerCase();
+    if (['script','style','noscript','iframe','svg','head','link','meta','br','hr'].indexOf(tag) !== -1) return null;
+
+    var info = { tag: tag };
+    if (node.id) info.id = node.id;
+
+    var cls = node.className;
+    if (cls && typeof cls === 'string') {
+      var parts = cls.trim().split(/\s+/).slice(0, 2);
+      if (parts.length) info.class = parts.join(' ');
+    }
+
+    // Text preview
+    var directText = '';
+    for (var c = node.firstChild; c; c = c.nextSibling) {
+      if (c.nodeType === 3) directText += c.textContent;
+    }
+    directText = directText.trim().slice(0, 80);
+    if (directText) info.text = directText;
+
+    // Image count in subtree
+    var imgs = node.querySelectorAll('img');
+    if (imgs.length) {
+      info.img_count = imgs.length;
+      var samples = [];
+      for (var i = 0; i < imgs.length && samples.length < 3; i++) {
+        var src = imgs[i].getAttribute('data-src') || imgs[i].getAttribute('data-lazyload-src') || imgs[i].src;
+        var u = normalizeUrl(src);
+        if (u) samples.push(u.slice(0, 120));
       }
+      if (samples.length) info.img_samples = samples;
     }
-    // Fallback: h1 with most text in main area
-    const h1s = document.querySelectorAll('h1');
-    let best = '';
-    for (const h of h1s) {
-      const t = h.textContent.trim();
-      if (t.length > best.length && t.length < 300) best = t;
+
+    // Rect
+    var rect = node.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) {
+      info.rect = { w: Math.round(rect.width), h: Math.round(rect.height), top: Math.round(rect.top) };
     }
-    return best || document.title.replace(/[\s-]+淘宝.*$/, '').trim();
+
+    // Visible or important
+    var isBig = rect.width > 200 && rect.height > 50;
+    var hasContent = directText.length > 0 || imgs.length > 0;
+
+    // Children (only if depth left and this node is meaningful)
+    if (maxDepth > 1 && (isBig || hasContent || node.children.length > 0)) {
+      var children = [];
+      for (var j = 0; j < node.children.length && children.length < maxChildren; j++) {
+        var child = buildDomOutline(node.children[j], maxDepth - 1, Math.floor(maxChildren / 2));
+        if (child) children.push(child);
+      }
+      if (children.length) info.children = children;
+    }
+
+    return info;
   }
 
-  function extractTaobaoPrice() {
-    // Tmall specific
-    let el = document.querySelector('.tm-promo-price .tm-price, .tm-price');
-    if (el) {
-      const m = el.textContent.match(/[\d.]+/);
-      if (m) return '¥' + m[0];
-    }
-    // Taobao specific
-    for (const sel of [
-      '.tb-rmb-num', '.tm-promo-price', '[class*="PriceBox"] span',
-      '.tb-price span', '.tb-price em', '.tb-price',
-      '[class*="tmPrice"]', '[class*="tbPrice"]',
-      'span.price', 'strong.price', '.price-value',
-    ]) {
-      el = document.querySelector(sel);
-      if (el) {
-        const t = el.textContent.trim();
-        const m = t.match(/[\d.]+/);
-        if (m) return '¥' + m[0];
-      }
-    }
-    return '';
-  }
-
-  function extractTaobaoImages() {
-    const urls = [];
-    const seen = new Set();
-
-    // Strategy: thumbnailsWrap (stable prefix)
-    const wraps = document.querySelectorAll('[class*="thumbnailsWrap"] img');
-    for (const img of wraps) {
-      const src = img.getAttribute('data-src') || img.src;
-      const u = normalizeUrl(src);
-      if (u && !seen.has(u) && isProductImage(u)) {
-        seen.add(u);
-        urls.push(u);
-      }
-    }
-    if (urls.length >= 2) return urls;
-
-    // Fallback: #J_UlThumb
-    const thumb = document.querySelector('#J_UlThumb');
-    if (thumb) {
-      for (const img of thumb.querySelectorAll('img')) {
-        const src = img.getAttribute('data-src') || img.src;
-        const u = normalizeUrl(src);
-        if (u && !seen.has(u) && isProductImage(u)) {
-          seen.add(u);
-          urls.push(u);
-        }
-      }
-    }
-    if (urls.length >= 2) return urls;
-
-    // Fallback: all alicdn images
-    for (const img of document.querySelectorAll('img')) {
-      const src = img.getAttribute('data-src') || img.getAttribute('data-original') || img.src;
-      const u = normalizeUrl(src);
-      if (!u || seen.has(u)) continue;
-      if (!isProductImage(u)) continue;
-      if (!/alicdn\.com|taobaocdn\.com|gw\.alicdn\.com/i.test(u)) continue;
-      const r = img.getBoundingClientRect();
-      if (r.width < 60 || r.height < 60) continue;
-      seen.add(u);
-      urls.push(u);
-    }
-    return urls.slice(0, 20);
-  }
-
-  function extractTaobaoSku() {
-    const items = [];
-    const seen = new Set();
-    // SKU containers
-    const containers = document.querySelectorAll(
-      '.tb-sku, .tb-prop, [class*="sku"], [class*="J_TSaleProp"], ' +
-      '[class*="sku-line"], [class*="prop-list"], [class*="valueItem"]'
+  function findInteractiveElements() {
+    var items = [];
+    // Tabs / nav items with clickable text
+    var tabCandidates = document.querySelectorAll(
+      '[role="tab"], .tab, .nav-item, .nav-link, [class*="tab-"], ' +
+      'li > a, .menu-item, [class*="menu-item"], [class*="Tab"]'
     );
-    for (const c of containers) {
-      for (const el of c.querySelectorAll('li, a, span')) {
-        const title = el.getAttribute('title') || el.textContent.trim();
-        if (!title || title.length > 50 || seen.has(title)) continue;
-        const r = el.getBoundingClientRect();
-        if (r.width < 8 || r.height < 8) continue;
-        const img = el.querySelector('img');
-        seen.add(title);
-        items.push({
-          name: title,
-          price: '',
-          images: img ? [normalizeUrl(img.getAttribute('data-src') || img.src)] : [],
-        });
+    for (var i = 0; i < tabCandidates.length; i++) {
+      var el = tabCandidates[i];
+      var text = el.textContent.trim();
+      if (!text || text.length > 30 || text.length < 1) continue;
+      // Only unique texts
+      var dup = false;
+      for (var j = 0; j < items.length; j++) {
+        if (items[j].text === text) { dup = true; break; }
       }
+      if (dup) continue;
+      var rect = el.getBoundingClientRect();
+      if (rect.width < 10 || rect.height < 10) continue;
+      items.push({
+        type: 'tab',
+        text: text,
+        rect: { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height) }
+      });
     }
-    return items;
+
+    // SKU / variant items
+    var skuCandidates = document.querySelectorAll(
+      '.tb-sku li, .sku-item, [class*="sku"] li, [class*="sku-value"], ' +
+      '.tb-prop li, [class*="prop"] li, [class*="valueItem"], ' +
+      '[class*="variant"], [class*="option-item"]'
+    );
+    for (var k = 0; k < skuCandidates.length; k++) {
+      var skuEl = skuCandidates[k];
+      var skuText = skuEl.textContent.trim();
+      if (!skuText || skuText.length > 40 || skuText.length < 1) continue;
+      var skuRect = skuEl.getBoundingClientRect();
+      if (skuRect.width < 8 || skuRect.height < 8) continue;
+      items.push({
+        type: 'sku',
+        text: skuText,
+        index: items.filter(function(it) { return it.type === 'sku'; }).length,
+        rect: { x: Math.round(skuRect.x), y: Math.round(skuRect.y), w: Math.round(skuRect.width), h: Math.round(skuRect.height) }
+      });
+    }
+
+    return items.slice(0, 30);
   }
 
-  function extract1688Title() {
-    const sel = [
-      '.d-title', 'h1[class*="title"]', '.mod-detail-title h1',
-      '.title-text', '[class*="product-title"]',
+  function samplePageImages() {
+    var urls = [];
+    var seen = {};
+    var allImgs = document.querySelectorAll('img');
+    for (var i = 0; i < allImgs.length && urls.length < 15; i++) {
+      var src = allImgs[i].getAttribute('data-src') || allImgs[i].getAttribute('data-lazyload-src') || allImgs[i].src;
+      var u = normalizeUrl(src);
+      if (!u || seen[u]) continue;
+      if (!isProductImage(u)) continue;
+      var r = allImgs[i].getBoundingClientRect();
+      if (r.width < 40 || r.height < 40) continue;
+      seen[u] = true;
+      urls.push(u);
+    }
+    return urls;
+  }
+
+  function buildSnapshot(extracted) {
+    var bodyOutline = buildDomOutline(document.body, 3, 20);
+    return {
+      url: window.location.href,
+      title: document.title.slice(0, 150),
+      platform: detectPlatform(),
+      viewport: { w: window.innerWidth, h: window.innerHeight },
+      scroll_y: Math.round(window.scrollY),
+      visible_text: getVisibleTextSample(3000),
+      outline: bodyOutline ? [bodyOutline] : [],
+      interactive: findInteractiveElements(),
+      images_sample: samplePageImages(),
+      extracted: extracted || {}
+    };
+  }
+
+  function getVisibleTextSample(maxLen) {
+    var text = '';
+    var skip = { script:1, style:1, noscript:1, iframe:1, svg:1, nav:1, footer:1, head:1 };
+    var walker = document.createTreeWalker(document.body, 4);
+    var node;
+    while ((node = walker.nextNode()) && text.length < maxLen) {
+      var p = node.parentElement;
+      if (!p || skip[p.tagName.toLowerCase()]) continue;
+      var t = node.textContent.trim();
+      if (t && t.length < 300) {
+        text += t + '\n';
+      }
+    }
+    return text.slice(0, maxLen);
+  }
+
+  // ═══════════════════════════════════════
+  // 3. Action Executor
+  // ═══════════════════════════════════════
+
+  function clickByText(text) {
+    // Find clickable element by visible text
+    var candidates = [];
+    var all = document.querySelectorAll('a, button, span, li, div, [role="tab"], [role="button"], [class*="tab"], [class*="nav"], [class*="menu"]');
+    for (var i = 0; i < all.length; i++) {
+      var t = all[i].textContent.trim();
+      if (t === text || t.indexOf(text) !== -1) {
+        var r = all[i].getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) {
+          candidates.push({ el: all[i], text: t, rect: r });
+        }
+      }
+    }
+    if (candidates.length === 0) return { clicked: false, reason: 'text not found: ' + text };
+
+    // Pick the best candidate (visible, in viewport, reasonable size)
+    candidates.sort(function (a, b) { return a.rect.top - b.rect.top; });
+    var best = candidates[0];
+    best.el.click();
+    return { clicked: true, text: best.text, selector: best.el.tagName + (best.el.className ? '.' + best.el.className.split(' ')[0] : '') };
+  }
+
+  function clickSkuByIndex(index) {
+    var skuEls = document.querySelectorAll(
+      '.tb-sku li, .sku-item, [class*="sku"] li, [class*="sku-value"], ' +
+      '.tb-prop li, [class*="prop"] li, [class*="valueItem"], ' +
+      '[class*="variant"], [class*="option-item"]'
+    );
+    if (index >= skuEls.length) return { clicked: false, reason: 'index ' + index + ' out of ' + skuEls.length + ' SKUs' };
+    var el = skuEls[index];
+    el.click();
+    return { clicked: true, text: el.textContent.trim().slice(0, 40), index: index };
+  }
+
+  function scrollBy(pixels) {
+    window.scrollBy(0, pixels);
+    return { scrolled: pixels, new_y: Math.round(window.scrollY) };
+  }
+
+  function readCurrentPrice() {
+    // Try common price selectors
+    var sels = [
+      '.tm-promo-price .tm-price', '.tm-price', '.tb-rmb-num',
+      '[class*="PriceBox"] span', '[class*="Price"] span',
+      '.tb-price', 'span.price', 'strong.price', '.price-value',
+      '.mod-detail-price .value', '[class*="detail-price"]',
     ];
-    for (const s of sel) {
-      const el = document.querySelector(s);
+    for (var i = 0; i < sels.length; i++) {
+      var el = document.querySelector(sels[i]);
       if (el) {
-        const t = el.textContent.replace(/[\s\n]+/g, ' ').trim();
-        if (t.length > 2) return t.slice(0, 200);
-      }
-    }
-    return document.title.replace(/[\s-]+.*$/, '').trim();
-  }
-
-  function extract1688Price() {
-    for (const sel of [
-      '.mod-detail-price .value', '.price-original',
-      '[class*="detail-price"] span', '.mod-price .price',
-      'span[class*="price"]',
-    ]) {
-      const el = document.querySelector(sel);
-      if (el) {
-        const t = el.textContent.trim();
-        const m = t.match(/[\d.]+/);
+        var t = el.textContent.trim();
+        var m = t.match(/[\d.]+/);
         if (m) return '¥' + m[0];
       }
     }
     return '';
   }
 
-  function extract1688Images() {
-    const urls = [];
-    const seen = new Set();
-    const gallery = document.querySelector('.tab-demo, [data-module-name="detail"], .mod-detail-gallery');
-    const imgs = gallery ? gallery.querySelectorAll('img') : [];
-    for (const img of imgs) {
-      const src = img.getAttribute('data-lazyload-src') || img.getAttribute('data-src') || img.src;
-      const u = normalizeUrl(src);
-      if (u && !seen.has(u) && isProductImage(u)) {
-        seen.add(u);
-        urls.push(u);
-      }
-    }
-    if (urls.length >= 2) return urls;
-    for (const img of document.querySelectorAll('img')) {
-      const src = img.getAttribute('data-lazyload-src') || img.getAttribute('data-src') || img.src;
-      const u = normalizeUrl(src);
-      if (!u || seen.has(u) || !isProductImage(u)) continue;
-      if (!/alicdn\.com|1688\.com|img\.cdn/i.test(u)) continue;
-      const r = img.getBoundingClientRect();
-      if (r.width < 60 || r.height < 60) continue;
-      seen.add(u);
-      urls.push(u);
-    }
-    return urls.slice(0, 20);
-  }
-
-  function extract1688Sku() {
-    const items = [];
-    const seen = new Set();
-    const containers = document.querySelectorAll('.mod-detail-sku, [class*="sku"], [class*="prop"]');
-    for (const c of containers) {
-      for (const el of c.querySelectorAll('li, span, a, div[class*="item"]')) {
-        const title = el.getAttribute('title') || el.textContent.trim();
-        if (!title || title.length > 50 || seen.has(title)) continue;
-        seen.add(title);
-        items.push({ name: title, price: '', images: [] });
-      }
-    }
-    return items;
-  }
-
-  function extractXHSData() {
-    // Xiaohongshu product detail page
-    const titleEl = document.querySelector('.title, [class*="title"], h1');
-    const priceEl = document.querySelector('.price, [class*="price"], .red-price');
-    const title = titleEl ? titleEl.textContent.trim().slice(0, 200) : '';
-    const price = priceEl
-      ? '¥' + (priceEl.textContent.match(/[\d.]+/) || [''])[0]
-      : '';
-    const imgs = [];
-    const seen = new Set();
-    for (const img of document.querySelectorAll('.note-scroller img, .swiper-slide img, [class*="carousel"] img')) {
-      const src = img.getAttribute('data-src') || img.src;
-      const u = normalizeUrl(src);
-      if (u && !seen.has(u) && isProductImage(u)) {
-        seen.add(u);
-        imgs.push(u);
-      }
-    }
-    return { title, price, images: imgs, skus: [] };
-  }
-
   // ═══════════════════════════════════════
-  // 4. Layout-based fallback (no CSS selectors)
+  // 4. AI Agent Loop
   // ═══════════════════════════════════════
 
-  function layoutCollectImages() {
-    const urls = [];
-    const seen = new Set();
-
-    // Find largest image-rich container in top half of page
-    const vh = window.innerHeight;
-    let best = null, bestScore = 0;
-
-    for (const el of document.querySelectorAll('div,ul,section,figure,li')) {
-      const r = el.getBoundingClientRect();
-      if (r.top > vh * 0.6 || r.bottom < 80) continue;
-      const imgs = el.querySelectorAll('img');
-      if (imgs.length < 2) continue;
-      const area = r.width * r.height;
-      if (area < 30000) continue;
-      const score = area * (1 + imgs.length * 0.3);
-      if (score > bestScore) { bestScore = score; best = el; }
-    }
-
-    const collect = (container) => {
-      if (!container) return;
-      for (const img of container.querySelectorAll('img')) {
-        for (const attr of ['data-src', 'data-original', 'data-lazyload-src', 'src']) {
-          const s = img.getAttribute(attr);
-          if (!s) continue;
-          const u = normalizeUrl(s);
-          if (!u || seen.has(u) || !isProductImage(u)) continue;
-          const r = img.getBoundingClientRect();
-          if (r.width < 50 || r.height < 50) continue;
-          seen.add(u);
-          urls.push(u);
-          break;
-        }
-      }
-    };
-
-    collect(best);
-    return urls;
-  }
-
-  function layoutCollectDescImages() {
-    // Find images between product detail section and recommendations
-    const urls = [];
-    const seen = new Set();
-    const MARKERS_START = ['图文详情', '产品详情', '商品详情', '规格参数'];
-    const MARKERS_END = ['本店推荐', '猜你喜欢', '看了又看', '店铺推荐'];
-
-    function findY(texts) {
-      const w = document.createTreeWalker(document.body, 4);
-      let n, bestY = null, bestDist = Infinity;
-      while (n = w.nextNode()) {
-        const txt = (n.textContent || '').trim();
-        if (txt.length > 20) continue;
-        for (const t of texts) {
-          if (txt === t || (txt.startsWith(t) && txt.length <= t.length + 2)) {
-            const range = document.createRange();
-            try { range.selectNodeContents(n); } catch (e) { continue; }
-            const rects = range.getClientRects();
-            for (const rc of rects) {
-              if (rc.height > 0 && rc.width > 0 && rc.top < bestDist) {
-                bestDist = rc.top;
-                bestY = rc.top;
-              }
-            }
-          }
-        }
-      }
-      return bestY;
-    }
-
-    const startY = findY(MARKERS_START);
-    if (startY === null) return [];
-
-    const endY = findY(MARKERS_END) || 999999;
-
-    for (const img of document.querySelectorAll('img')) {
-      const r = img.getBoundingClientRect();
-      if (r.top < startY || r.top > endY) continue;
-      if (r.width < 60 || r.height < 60) continue;
-      for (const attr of ['data-src', 'data-ks-lazyload', 'data-original', 'src']) {
-        const s = img.getAttribute(attr);
-        if (!s) continue;
-        const u = normalizeUrl(s);
-        if (u && !seen.has(u)) {
-          seen.add(u);
-          urls.push(u);
-          break;
-        }
-      }
-    }
-    return urls;
-  }
-
-  function layoutGetAllText() {
-    // Get visible text only (skip script/style/svg/nav/footer)
-    let text = '';
-    const SKIP = new Set(['script', 'style', 'noscript', 'iframe', 'svg', 'nav', 'footer', 'head']);
-    const w = document.createTreeWalker(document.body, 4);
-    let n;
-    while (n = w.nextNode()) {
-      const p = n.parentElement;
-      if (!p || SKIP.has(p.tagName.toLowerCase())) continue;
-      if (p.offsetParent === null && p.tagName !== 'BODY') continue;
-      const t = n.textContent.trim();
-      if (t) {
-        // Avoid super-long lines (like encoded base64)
-        text += (t.length > 500 ? t.slice(0, 497) + '...' : t) + '\n';
-      }
-      if (text.length > 15000) break;
-    }
-    return text;
-  }
-
-  // ═══════════════════════════════════════
-  // 5. API interception — try to get clean data
-  // ═══════════════════════════════════════
-
-  let interceptedData = null;
-
-  function setupApiInterceptor() {
-    // Hook fetch to capture product detail API responses
-    const origFetch = window.fetch;
-    const pattern = /mtop\.(taobao|tmall|alibaba)\.detail/i;
-
-    window.fetch = function (input, init) {
-      const url = typeof input === 'string' ? input : (input && input.url) || '';
-      const promise = origFetch.call(this, input, init);
-
-      if (pattern.test(url)) {
-        promise.then(async (resp) => {
-          try {
-            const clone = resp.clone();
-            const data = await clone.json();
-            interceptedData = { url, data, time: Date.now() };
-          } catch (e) { /* ignore parse errors */ }
-        }).catch(() => {});
-      }
-
-      return promise;
-    };
-  }
-
-  // ═══════════════════════════════════════
-  // 6. Main extraction orchestrator
-  // ═══════════════════════════════════════
-
-  function extract() {
-    const url = window.location.href;
-    const platform = detectPlatform(url);
-
+  async function aiExtract(apiUrl, debug) {
+    var platform = detectPlatform();
     if (!platform) {
-      return { error: 'unsupported_platform', url };
+      return { error: 'unsupported_platform', url: window.location.href };
     }
 
-    let result = { url, platform };
+    var extracted = {};
+    var history = [];
+    var maxRounds = 6;
+    var debugLog = [];
+    var dom = buildSnapshot(extracted);
 
-    // ── Platform-specific extraction ──
-    if (platform === 'taobao' || platform === 'tmall') {
-      result = {
-        ...result,
-        title_cn: extractTaobaoTitle(),
-        price_cn: extractTaobaoPrice(),
-        image_urls: extractTaobaoImages(),
-        sku_prices: extractTaobaoSku(),
+    for (var round = 0; round < maxRounds; round++) {
+      var stepEntry = {
+        step: round,
+        request: { platform: platform, round: round, dom_size: JSON.stringify(dom).length, history_count: history.length },
+        response: null,
+        actions: [],
+        results: []
       };
-    } else if (platform === 'alibaba') {
-      result = {
-        ...result,
-        title_cn: extract1688Title(),
-        price_cn: extract1688Price(),
-        image_urls: extract1688Images(),
-        sku_prices: extract1688Sku(),
-      };
-    } else if (platform === 'xiaohongshu') {
-      const xhs = extractXHSData();
-      result = {
-        ...result,
-        title_cn: xhs.title,
-        price_cn: xhs.price,
-        image_urls: xhs.images,
-        sku_prices: xhs.skus,
-      };
+
+      if (debug) {
+        stepEntry.dom_outline = JSON.parse(JSON.stringify(dom.outline).slice(0, 3000));
+        stepEntry.dom_interactive = dom.interactive.slice(0, 15);
+        stepEntry.dom_images = dom.images_sample;
+        console.log('[AI Agent] Step ' + round + ' request dom_size=' + stepEntry.request.dom_size + ' interactive_count=' + dom.interactive.length);
+      }
+
+      var plan;
+      try {
+        var resp = await fetch(apiUrl + '/api/ai-agent/step', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            platform: platform,
+            round: round,
+            dom: dom,
+            history: history,
+            debug: debug
+          }),
+          signal: AbortSignal.timeout(30000),
+        });
+        plan = await resp.json();
+      } catch (e) {
+        stepEntry.response = { error: e.message };
+        debugLog.push(stepEntry);
+        history.push({ round: round, action: { type: 'error' }, result: e.message });
+        break;
+      }
+
+      stepEntry.response = plan;
+
+      if (debug) {
+        console.log('[AI Agent] Step ' + round + ' response done=' + plan.done + ' actions=' + (plan.actions ? plan.actions.length : 0));
+      }
+
+      if (plan.done) {
+        if (debug) stepEntry.response = JSON.parse(JSON.stringify(plan));
+        debugLog.push(stepEntry);
+        var data = plan.data || extracted;
+        return buildResult(data, platform, debugLog);
+      }
+
+      if (!plan.actions || !plan.actions.length) {
+        debugLog.push(stepEntry);
+        history.push({ round: round, action: { type: 'noop' }, result: 'no actions returned' });
+        break;
+      }
+
+      for (var a = 0; a < plan.actions.length; a++) {
+        var action = plan.actions[a];
+        var actionResult;
+
+        try {
+          switch (action.type) {
+            case 'click':
+              actionResult = clickByText(action.text || '');
+              break;
+            case 'click_sku':
+              actionResult = clickSkuByIndex(action.index !== undefined ? action.index : 0);
+              break;
+            case 'scroll':
+              actionResult = scrollBy(action.pixels || 500);
+              break;
+            case 'wait':
+              await new Promise(function (r) { setTimeout(r, action.ms || 1500); });
+              actionResult = { waited: action.ms || 1500 };
+              break;
+            case 'extract':
+              actionResult = { price_now: readCurrentPrice(), scroll_y: Math.round(window.scrollY) };
+              if (readCurrentPrice() && !extracted.price_cn) extracted.price_cn = readCurrentPrice();
+              break;
+            default:
+              actionResult = { error: 'unknown action type: ' + action.type };
+          }
+        } catch (e) {
+          actionResult = { error: e.message };
+        }
+
+        stepEntry.actions.push(action);
+        stepEntry.results.push(actionResult);
+        history.push({ round: round, action: action, result: actionResult });
+
+        if (action.type === 'click' || action.type === 'click_sku' || action.type === 'scroll') {
+          await new Promise(function (r) { setTimeout(r, 800); });
+        }
+      }
+
+      debugLog.push(stepEntry);
+      dom = buildSnapshot(extracted);
     }
 
-    // ── Layout-based fallback for missing data ──
-    if (!result.title_cn || result.title_cn.length < 2) {
-      const h1 = document.querySelector('h1');
-      result.title_cn = h1 ? h1.textContent.trim().slice(0, 200) : document.title;
-    }
+    return buildResult(extracted, platform, debugLog);
+  }
 
-    if (!result.image_urls || result.image_urls.length < 2) {
-      result.image_urls = layoutCollectImages();
-    }
-
-    // Dedupe and filter images
-    result.image_urls = dedupeUrls(result.image_urls || []);
-
-    // ── Description images (layout-based, no platform selectors) ──
-    result.desc_images = layoutCollectDescImages();
-    result.desc_images = dedupeUrls(result.desc_images);
-
-    // ── Description text (clean text) ──
-    result.description_cn = layoutGetAllText();
-
-    // ── API intercepted data (bonus) ──
-    if (interceptedData) {
-      result._api_data = {
-        url: interceptedData.url,
-        has_data: !!interceptedData.data,
-      };
-    }
-
+  function buildResult(data, platform, debugLog) {
+    var result = {
+      url: window.location.href,
+      platform: platform,
+      title_cn: data.title_cn || document.querySelector('h1')?.textContent?.trim()?.slice(0, 200) || document.title.replace(/[\s-]+(淘宝|天猫|1688).*$/, '').trim(),
+      price_cn: data.price_cn || '',
+      image_urls: data.image_urls || [],
+      desc_images: data.desc_images || [],
+      sku_prices: data.sku_prices || [],
+      description_cn: data.description_cn || getVisibleTextSample(15000),
+    };
+    if (debugLog && debugLog.length) result._debug = debugLog;
     return result;
   }
 
   // ═══════════════════════════════════════
-  // 7. Message listener
+  // 5. Message Listener
   // ═══════════════════════════════════════
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.action === 'extract') {
-      const data = extract();
-      sendResponse(data);
-      return true; // keep channel open for async
+      var apiUrl = msg.apiUrl || 'http://localhost:8765';
+      var debug = !!msg.debug;
+      aiExtract(apiUrl, debug).then(function (data) {
+        sendResponse(data);
+      });
+      return true;
     }
 
     if (msg.action === 'ping') {
-      const platform = detectPlatform();
+      var platform = detectPlatform();
       sendResponse({
         ok: true,
-        platform,
+        platform: platform,
         url: window.location.href,
         is_product: !!platform && window.location.pathname.length > 3,
       });
       return true;
     }
   });
-
-  // Setup API interceptor on load
-  setupApiInterceptor();
 
 })();

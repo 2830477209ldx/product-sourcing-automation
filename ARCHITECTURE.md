@@ -10,9 +10,7 @@
 ```
 product-sourcing-automation/
 ├── run.py                          # CLI entry point (Click)
-├── test_scrape.py                  # Experimental test script
 ├── pyproject.toml                  # Project metadata & dependencies
-├── requirements.txt                # Pip dependencies
 ├── ARCHITECTURE.md                 # This document
 │
 ├── config/
@@ -27,9 +25,7 @@ product-sourcing-automation/
 │   ├── db/
 │   │   └── repository.py           # Async SQLite product repository
 │   ├── llm/
-│   │   └── service.py              # Unified LLM service (DeepSeek)
-│   ├── loader/
-│   │   └── url_loader.py           # Dual-mode URL content loader
+│   │   └── service.py              # Unified LLM service (DeepSeek/Gemini)
 │   ├── models/
 │   │   └── product.py              # Pydantic data models & enums
 │   ├── pipeline/
@@ -37,11 +33,22 @@ product-sourcing-automation/
 │   │   ├── pipeline.py             # Pipeline orchestrator
 │   │   └── stages.py               # 5 pipeline stages
 │   ├── processing/
-│   │   └── image_styler.py         # Image adaptation for US market
+│   │   ├── image_styler.py         # Local image adaptation (OpenCV)
+│   │   └── image_api.py            # External image API client (Gemini)
 │   ├── shopify/
 │   │   └── csv_exporter.py         # Shopify CSV exporter
+│   ├── api/
+│   │   └── server.py               # FastAPI server (Chrome extension backend)
 │   └── webui/
-│       └── app.py                  # Streamlit review dashboard
+│       ├── app.py                  # Streamlit review dashboard
+│       └── excel_exporter.py       # Shopify 75-column Excel exporter
+│
+├── chrome-extension/               # Chrome extension (one-click import)
+│   ├── manifest.json
+│   ├── background.js
+│   ├── content-script.js
+│   └── popup/
+│       └── popup.js
 │
 └── data/
     ├── products.db                  # SQLite database (runtime)
@@ -49,7 +56,7 @@ product-sourcing-automation/
     ├── cookies.json                # Saved browser cookies
     ├── images/                     # Downloaded product images (per-product folder)
     ├── processed/                  # US-adapted images
-    └── exports/                    # CSV export output
+    └── exports/                    # CSV/XLSX export output
 ```
 
 ---
@@ -226,28 +233,11 @@ logging:       # Loguru log level/format/rotation
 
 ---
 
-### 2.9 `src/loader/url_loader.py` — URL Loader
-
-**Tech:** Playwright (Edge browser), httpx + BeautifulSoup fallback
-
-| Class/Method | Description |
-|---|---|
-| `PageContent(url, title, text, image_urls)` | Simple data class for loaded page |
-| `URLProductLoader(headless=True)` | Dual-mode loader |
-| `load(url)` → `PageContent` | Primary: Playwright → fallback: httpx |
-| `_load_with_browser(url)` | Playwright Edge browser with stealth UA, script/style/nav/footer removal |
-| `_load_with_httpx(url)` | httpx + BeautifulSoup(lxml), same cleaning logic |
-| `close()` | Close browser and playwright |
-
-**Image filtering:** Skips URLs containing: icon, logo, avatar, banner, qr_code, loading, pixel, track, beacon, 1x1, btn, button, arrow, back_top, share, collect, cart
-
----
-
-### 2.10 `src/pipeline/stages.py` — Pipeline Stages
+### 2.9 `src/pipeline/stages.py` — Pipeline Stages
 
 | Stage | Class | Input | Output | Key Logic |
 |---|---|---|---|---|
-| **1. Load** | `LoadStage` | `url: str` | `Product(scraped)` | URLProductLoader.load() → Product with raw data |
+| **1. Load** | `LoadStage` | `url: str` | `Product(scraped)` | ProductAgent.extract() → Product with raw data |
 | **2. Extract** | `ExtractStage` | `Product` | `Product` | LLM structured extraction: title_en, description_en, price_usd, tags, sku_prices |
 | **3. Analyze** | `AnalyzeStage` | `Product` | `Product` | LLM market scoring 0-100. Below threshold → ARCHIVED; above → ANALYZED |
 | **4. Process** | `ProcessStage` | `Product` | `Product` | LLM SEO description + download images + ImageStyler.adapt() |
@@ -262,7 +252,7 @@ logging:       # Loguru log level/format/rotation
 
 ---
 
-### 2.11 `src/processing/image_styler.py` — Image Processor
+### 2.10 `src/processing/image_styler.py` — Image Processor
 
 **Tech:** OpenCV, Pillow (PIL)
 
@@ -278,7 +268,7 @@ logging:       # Loguru log level/format/rotation
 
 ---
 
-### 2.12 `src/shopify/csv_exporter.py` — CSV Exporter
+### 2.11 `src/shopify/csv_exporter.py` — CSV Exporter
 
 | Method | Description |
 |---|---|
@@ -289,7 +279,7 @@ logging:       # Loguru log level/format/rotation
 
 ---
 
-### 2.13 `src/webui/app.py` — Streamlit Dashboard
+### 2.12 `src/webui/app.py` — Streamlit Dashboard
 
 **Tech:** Streamlit
 

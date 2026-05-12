@@ -94,25 +94,16 @@ class ProductAgent:
 
     async def _get_browser(self) -> Browser:
         if self._browser is None:
-            storage_state = None
-            if COOKIES_FILE.exists():
-                try:
-                    data = json.loads(COOKIES_FILE.read_text(encoding="utf-8"))
-                    if isinstance(data, dict) and "cookies" in data:
-                        storage_state = data
-                        print(f"  Loading saved session ({len(data.get('cookies', []))} cookies)")
-                except Exception as exc:
-                    print(f"  Failed to load cookies: {exc}")
-
             for attempt in range(3):
                 try:
                     profile = BrowserProfile(
                         headless=self.headless,
                         keep_alive=True,
-                        storage_state=storage_state,
+                        user_data_dir=str(PROFILE_DIR),
                     )
                     self._browser = Browser(browser_profile=profile)
                     await self._browser.start()
+                    print(f"  Browser started (profile: {PROFILE_DIR})")
                     break
                 except Exception as exc:
                     if attempt < 2:
@@ -172,6 +163,12 @@ class ProductAgent:
 
         if body_len < 200:
             logger.warning(f"Page appears empty ({body_len} chars), proceeding anyway")
+
+        # Guard: if still on login page, abort extraction
+        if "login" in str(current_url).lower():
+            print("\n  ⚠️  Still on login page — please scan the QR code with Taobao app.")
+            print("  The browser profile is new. After this login, all future runs auto-login.\n")
+            return {"_error": "login_required", "source_url": url}
 
         # ── Save cookies ──
         try:
