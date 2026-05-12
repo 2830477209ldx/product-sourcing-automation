@@ -344,6 +344,7 @@ class ProductAgent:
         print(f"  SKU variants:   {len(result.get('sku_prices', []))}")
         print(f"  Desc images:    {len(result.get('desc_images', []))}")
         print(f"  Price:          {result.get('price_cn', '')}")
+        print(f"  SKU state:      {result.get('sku_state', '')}")
         print("=" * 60)
 
     async def close(self) -> None:

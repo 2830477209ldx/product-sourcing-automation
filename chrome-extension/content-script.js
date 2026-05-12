@@ -1,13 +1,15 @@
 /**
- * Product Sourcing Importer — Conversational DOM Drilling
+ * Product Sourcing Importer — Hybrid Extraction Engine
  *
- * Innovation: AI explores the DOM progressively like a developer using DevTools.
- * Instead of sending the entire DOM tree at once, the script sends only top-level
- * node summaries first. AI then "drills down" into specific nodes that look
- * promising, accumulating context across rounds until it finds what it needs.
+ * Architecture v2:
+ *   Phase 1: Local Fast Extract (<500ms, no AI)
+ *     - Heuristic title/price/images/SKU extraction
+ *     - Batch SKU price collection with MutationObserver
+ *   Phase 2: AI Fallback (only if local score < 70%)
+ *     - Conversational DOM drilling (original approach)
+ *     - Starts with local data as baseline
  *
- * Operations: expand_dom | click_sku | read_price | extract (done)
- * No scrolling — only SKU clicking for price collection.
+ * Operations: expand_dom | click_sku | read_price | collect_images | extract
  */
 (function () {
   'use strict';
@@ -30,7 +32,7 @@
   // 2. DOM Progressive Explorer
   // ═══════════════════════════════════════
 
-  var SKIP_TAGS = ['script','style','noscript','iframe','svg','head','link','meta','br','hr','wbr'];
+  var SKIP_TAGS = ['script', 'style', 'noscript', 'iframe', 'svg', 'head', 'link', 'meta', 'br', 'hr', 'wbr'];
 
   function normalizeUrl(url) {
     if (!url) return '';
@@ -39,16 +41,34 @@
     return url.replace(/_\d+x\d+\./g, '.').split('?')[0];
   }
 
+  // [FIX] Word-boundary matching: normalize URL separators to spaces
+  // so /\bicon\b/ matches "icon" in "nav-icon-32" → "nav icon 32"
+  var SKIP_IMG_PATTERNS = [
+    /\bicon\b/, /\blogo\b/, /\bavatar\b/, /\bbanner\b/, /\bqrcode\b/,
+    /\bloading\b/, /\bpixel\b/, /\btrack(?:er)?\b/, /\bbeacon\b/,
+    /\bbutton\b/, /\barrow\b/, /\bback.?top\b/, /\bshare\b/,
+    /\bcollect\b/, /\bcart\b/, /\bstar\b/, /\bcrown\b/, /\bmedal\b/,
+    /\bbadge\b/, /\bgotop\b/, /\bupup\b/, /\berweima\b/, /\bevaluate\b/,
+    /\brating\b/,
+  ];
+
   function isProductImage(url) {
     if (!url) return false;
-    var skipWords = ['icon','logo','avatar','banner','qrcode','loading','pixel','track','beacon',
-      'btn','button','arrow','back_top','share','collect','cart','star','crown','medal','badge',
-      'gotop','upup','erweima','evaluate','rating'];
-    var low = url.toLowerCase();
-    for (var i = 0; i < skipWords.length; i++) {
-      if (low.indexOf(skipWords[i]) !== -1) return false;
+    var normalized = url.toLowerCase().replace(/[-_.\/\?=&#:]/g, ' ');
+    for (var i = 0; i < SKIP_IMG_PATTERNS.length; i++) {
+      if (SKIP_IMG_PATTERNS[i].test(normalized)) return false;
     }
     return true;
+  }
+
+  // [NEW] Unified image source extraction — covers all common lazy-load attrs
+  function getImageSrc(el) {
+    return el.getAttribute('data-src')
+      || el.getAttribute('data-lazyload-src')
+      || el.getAttribute('data-original')
+      || el.getAttribute('data-lazy-src')
+      || el.src
+      || '';
   }
 
   function getNodeAtPath(pathStr) {
@@ -100,7 +120,7 @@
       info.imgs = imgs.length;
       var samples = [];
       for (var i = 0; i < imgs.length && samples.length < 2; i++) {
-        var src = imgs[i].getAttribute('data-src') || imgs[i].getAttribute('data-lazyload-src') || imgs[i].src;
+        var src = getImageSrc(imgs[i]); // [FIX] use unified helper
         var u = normalizeUrl(src);
         if (u && isProductImage(u)) samples.push(u.slice(0, 120));
       }
@@ -109,7 +129,12 @@
 
     var rect = node.getBoundingClientRect();
     if (rect.width > 0 && rect.height > 0) {
-      info.rect = { w: Math.round(rect.width), h: Math.round(rect.height), t: Math.round(rect.top + window.scrollY) };
+      // [FIX] Math.round both components separately
+      info.rect = {
+        w: Math.round(rect.width),
+        h: Math.round(rect.height),
+        t: Math.round(rect.top) + Math.round(window.scrollY),
+      };
     }
 
     var visibleChildren = getVisibleChildren(node);
@@ -117,10 +142,15 @@
       info.child_count = visibleChildren.length;
     }
 
-    var hasSkuHints = node.querySelector('[data-value],[data-sku-id],[data-sku],[class*="sku"],[class*="prop"]');
+    var hasSkuHints = node.querySelector(
+      '[data-value],[data-sku-id],[data-sku],[class*="sku"],[class*="prop"]'
+    );
     if (hasSkuHints) info.has_sku = true;
 
-    var hasPriceHints = node.querySelector('[class*="rice"],[class*="Rice"]');
+    // [FIX] Match "price" as a distinct class segment, not substring like "service"/"device"
+    var hasPriceHints = node.querySelector(
+      '[class~="price"],[class*="-price"],[class*="Price"],[class*="price-"],[data-price]'
+    );
     if (hasPriceHints) info.has_price = true;
 
     return info;
@@ -140,9 +170,12 @@
     return {
       path: pathStr,
       parent_tag: node.tagName.toLowerCase(),
-      parent_class: (node.className && typeof node.className === 'string') ? node.className.trim().split(/\s+/).slice(0, 3).join(' ') : '',
+      parent_class:
+        node.className && typeof node.className === 'string'
+          ? node.className.trim().split(/\s+/).slice(0, 3).join(' ')
+          : '',
       total_children: visibleChildren.length,
-      children: summaries
+      children: summaries,
     };
   }
 
@@ -154,27 +187,189 @@
       platform: detectPlatform(),
       viewport: { w: window.innerWidth, h: window.innerHeight },
       page_height: Math.round(document.body.scrollHeight),
-      top_level: topLevel
+      top_level: topLevel,
     };
   }
 
   // ═══════════════════════════════════════
-  // 3. Action Executors
+  // 3. Price Zone Detection & Smart Waiting
   // ═══════════════════════════════════════
 
-  function isSkuDisabled(el) {
-    var cls = (el.className || '').toLowerCase();
-    if (cls.indexOf('disable') !== -1 || cls.indexOf('soldout') !== -1 || cls.indexOf('sold-out') !== -1) return true;
-    if (el.getAttribute('aria-disabled') === 'true') return true;
-    var style = window.getComputedStyle(el);
-    if (parseFloat(style.opacity) < 0.4) return true;
-    var color = style.color || '';
-    if (color === 'rgb(153, 153, 153)' || color === 'rgb(204, 204, 204)' || color === '#999' || color === '#ccc') return true;
-    // Check for disabled class on parent li
-    var li = el.closest('li');
-    if (li && (li.className || '').toLowerCase().indexOf('disable') !== -1) return true;
-    return false;
+  var _priceZoneCache = null;
+  var _priceZoneCacheTime = 0;
+  var PRICE_ZONE_TTL = 5000; // ms — cache price zone for 5s
+
+  // [NEW] Score DOM elements to find the primary price display area.
+  // Returns the element most likely showing the product's current price,
+  // or null if nothing credible is found.
+  function findPriceZone() {
+    var now = Date.now();
+    if (_priceZoneCache && now - _priceZoneCacheTime < PRICE_ZONE_TTL) {
+      return _priceZoneCache;
+    }
+
+    var candidates = [];
+    var priceSels = [
+      '.tm-promo-price .tm-price', '.tm-price', '.tb-rmb-num',
+      '[class*="PriceBox"] span', '[class*="Price"] span',
+      '.tb-price', 'span.price', 'strong.price', '.price-value',
+      '.mod-detail-price .value', '[class*="detail-price"]',
+      '[class*="priceValue"]', '[class*="price-value"]',
+      '[class*="currentPrice"]', '[class*="nowPrice"]',
+      '[class*="salePrice"]', '[class*="promoPrice"]',
+      '[data-price]', '[data-spm="price"]',
+    ];
+
+    for (var i = 0; i < priceSels.length; i++) {
+      var els = document.querySelectorAll(priceSels[i]);
+      for (var j = 0; j < els.length; j++) {
+        var el = els[j];
+        var text = (el.textContent || '').trim();
+        var m = text.match(/[¥￥]?\s*(\d+\.?\d*)/);
+        if (!m || parseFloat(m[1]) <= 0) continue;
+
+        // Penalise: strikethrough / original-price elements
+        if (el.closest('del, s, strike')) continue;
+        if (/原价|划线价|定价|参考价|吊牌价/.test(text)) continue;
+        var parentCls = (el.parentElement && el.parentElement.className || '').toLowerCase();
+        if (/\boriginal\b|\bold.?price\b|\bwas\b/.test(parentCls)) continue;
+
+        var rect = el.getBoundingClientRect();
+        var score = 0;
+
+        if (rect.top > 0 && rect.top < window.innerHeight) score += 10; // visible
+        if (rect.width > 30) score += 5;
+        if (/price|Price/i.test(el.className || '')) score += 8;
+        if (/¥|￥/.test(text)) score += 5;
+
+        var cs = window.getComputedStyle(el);
+        var fontSize = parseFloat(cs.fontSize) || 0;
+        if (fontSize > 20) score += 6;
+        else if (fontSize > 16) score += 4;
+        else if (fontSize > 12) score += 2;
+
+        var fontWeight = parseInt(cs.fontWeight, 10) || 400;
+        if (fontWeight >= 600) score += 3;
+
+        if (el.id && /price/i.test(el.id)) score += 5;
+
+        candidates.push({ el: el, score: score });
+      }
+    }
+
+    _priceZoneCacheTime = now;
+    if (!candidates.length) {
+      _priceZoneCache = null;
+      return null;
+    }
+
+    candidates.sort(function (a, b) { return b.score - a.score; });
+    _priceZoneCache = candidates[0].el;
+    return _priceZoneCache;
   }
+
+  // [NEW] Wait for price to change using MutationObserver + polling fallback.
+  // Returns the new price string, or whatever readCurrentPrice() gives on timeout.
+  function waitForPriceChange(oldPrice, timeoutMs) {
+    timeoutMs = timeoutMs || 3000;
+    return new Promise(function (resolve) {
+      var resolved = false;
+      var observer = null;
+      var pollTimer = null;
+
+      function cleanup() {
+        if (observer) observer.disconnect();
+        if (pollTimer) clearInterval(pollTimer);
+      }
+
+      function check() {
+        if (resolved) return;
+        var p = readCurrentPrice();
+        if (p && p !== oldPrice) {
+          resolved = true;
+          cleanup();
+          resolve(p);
+        }
+      }
+
+      // Primary: MutationObserver on price zone
+      var zone = findPriceZone();
+      if (zone) {
+        observer = new MutationObserver(function () { check(); });
+        observer.observe(zone, {
+          childList: true, subtree: true, characterData: true,
+        });
+      }
+
+      // Fallback: poll every 150ms
+      pollTimer = setInterval(function () { check(); }, 150);
+
+      // Hard timeout
+      setTimeout(function () {
+        if (!resolved) {
+          resolved = true;
+          cleanup();
+          resolve(readCurrentPrice());
+        }
+      }, timeoutMs);
+    });
+  }
+
+  // ═══════════════════════════════════════
+  // 4. Price Reader (context-aware)
+  // ═══════════════════════════════════════
+
+  // [REWRITTEN] Three phases with decreasing specificity.
+  // No more global body.innerText scan — that was the main source of false positives.
+  function readCurrentPrice() {
+    // Phase 1: Price zone (highest confidence)
+    var zone = findPriceZone();
+    if (zone) {
+      var zoneText = (zone.textContent || '').trim();
+      var zm = zoneText.match(/[¥￥]\s*(\d+\.?\d*)/);
+      if (zm && zm[1] && parseFloat(zm[1]) > 0) return '¥' + zm[1];
+      zm = zoneText.match(/(\d+\.?\d*)/);
+      if (zm && zm[1] && parseFloat(zm[1]) > 0) return '¥' + zm[1];
+    }
+
+    // Phase 2: Known CSS selector patterns
+    var sels = [
+      '.tm-promo-price .tm-price', '.tm-price', '.tb-rmb-num',
+      '[class*="PriceBox"] span', '[class*="Price"] span',
+      '.tb-price', 'span.price', 'strong.price', '.price-value',
+      '.mod-detail-price .value', '[class*="detail-price"]',
+      '[class*="priceValue"]', '[class*="price-value"]',
+      '[class*="currentPrice"]', '[class*="nowPrice"]',
+      '[class*="totalPrice"]', '[class*="salePrice"]',
+      '[class*="promoPrice"]', '[class*="promo-price"]',
+      '[data-price]', '[data-spm="price"]',
+    ];
+    for (var i = 0; i < sels.length; i++) {
+      var el = document.querySelector(sels[i]);
+      if (!el) continue;
+      // Skip strikethrough
+      if (el.closest('del, s, strike')) continue;
+      var t = (el.textContent || el.innerText || '').trim();
+      var sm = t.match(/[¥￥]\s*(\d+\.?\d*)/);
+      if (sm && sm[1] && parseFloat(sm[1]) > 0) return '¥' + sm[1];
+      sm = t.match(/^(\d+\.?\d*)/);
+      if (sm && sm[1] && parseFloat(sm[1]) > 0) return '¥' + sm[1];
+    }
+
+    // Phase 3: Data attributes
+    var dataEl = document.querySelector('[data-price]');
+    if (dataEl) {
+      var val = dataEl.getAttribute('data-price') || dataEl.textContent;
+      var dm = String(val).match(/(\d+\.?\d*)/);
+      if (dm && dm[1] && parseFloat(dm[1]) > 0) return '¥' + dm[1];
+    }
+
+    return '';
+  }
+
+  // ═══════════════════════════════════════
+  // 5. Action Executors
+  // ═══════════════════════════════════════
 
   function findSkuElements() {
     var skuEls = document.querySelectorAll(
@@ -193,34 +388,18 @@
       var rect = el.getBoundingClientRect();
       if (rect.width < 8 || rect.height < 8) continue;
       seen[text] = true;
-      results.push({ el: el, text: text, index: results.length, disabled: isSkuDisabled(el) });
+      results.push({ el: el, text: text, index: results.length });
     }
     return results;
-  }
-
-  function findSkuState() {
-    var all = findSkuElements();
-    var available = [];
-    var disabled = [];
-    for (var i = 0; i < all.length; i++) {
-      if (all[i].disabled) {
-        disabled.push({ index: all[i].index, text: all[i].text });
-      } else {
-        available.push({ index: all[i].index, text: all[i].text });
-      }
-    }
-    return { available: available, disabled: disabled, total: all.length };
   }
 
   function findSkuGroups() {
     var all = findSkuElements();
     if (all.length === 0) return [];
 
-    // Group by parent container — each container = one SKU dimension (color, size, etc.)
     var groups = {};
     for (var i = 0; i < all.length; i++) {
       var el = all[i].el;
-      // Find the nearest container parent (ul, div with sku/prop/value class)
       var container = el.parentElement;
       while (container && container !== document.body) {
         var tag = container.tagName.toLowerCase();
@@ -237,65 +416,95 @@
       groups[groupKey].push({ index: all[i].index, text: all[i].text });
     }
 
+    // [FIX] Multi-language dimension name detection
+    var groupNames = [
+      '颜色', 'color', 'colour',
+      '尺码', 'size',
+      '规格', 'spec', 'specification',
+      '套餐', 'combo', 'package', 'bundle',
+      '款式', 'style',
+      '版本', 'version',
+      '容量', 'capacity',
+      '型号', 'model',
+      '材质', 'material',
+      '图案', 'pattern',
+    ];
+
     var result = [];
-    var groupNames = ['颜色', '尺码', '规格', '套餐', '款式', '版本', '容量', '型号'];
     var gi = 0;
     for (var key in groups) {
-      if (groups.hasOwnProperty(key)) {
-        // Try to match a dimension name from the container's preceding label
-        var dimension = 'dim' + gi;
-        var container = groups[key].length > 0 ? all.find(function(s) { return s.text === groups[key][0].text; }) : null;
-        if (container && container.el) {
-          var c = container.el.parentElement;
-          while (c && c !== document.body) {
-            var prevLabel = c.previousElementSibling || (c.parentElement ? c.parentElement.querySelector('span, label, dt') : null);
-            if (prevLabel) {
-              var labelText = (prevLabel.textContent || '').trim().replace(/[:：]/g, '');
-              for (var gn = 0; gn < groupNames.length; gn++) {
-                if (labelText.indexOf(groupNames[gn]) !== -1) {
-                  dimension = groupNames[gn];
-                  break;
-                }
+      if (!groups.hasOwnProperty(key)) continue;
+      var dimension = 'dim' + gi;
+      var firstItem = groups[key].length > 0
+        ? all.find(function (s) { return s.text === groups[key][0].text; })
+        : null;
+      if (firstItem && firstItem.el) {
+        var c = firstItem.el.parentElement;
+        while (c && c !== document.body) {
+          var prevLabel = c.previousElementSibling ||
+            (c.parentElement ? c.parentElement.querySelector('span, label, dt') : null);
+          if (prevLabel) {
+            var labelText = (prevLabel.textContent || '').trim().replace(/[:：]/g, '').toLowerCase();
+            for (var gn = 0; gn < groupNames.length; gn++) {
+              if (labelText.indexOf(groupNames[gn].toLowerCase()) !== -1) {
+                dimension = groupNames[gn];
+                break;
               }
-              if (dimension !== 'dim' + gi) break;
             }
-            c = c.parentElement;
+            if (dimension !== 'dim' + gi) break;
           }
+          c = c.parentElement;
         }
-        result.push({ dimension: dimension, group: gi, options: groups[key] });
-        gi++;
       }
+      result.push({ dimension: dimension, group: gi, options: groups[key] });
+      gi++;
     }
     return result;
   }
 
+  // [FIX] Exact match first, then prefix/suffix, never bare substring
   function clickSkuByLabel(label) {
+    if (!label) return { clicked: false, reason: 'empty label' };
     var skus = findSkuElements();
+
+    // 1. Exact match
     for (var i = 0; i < skus.length; i++) {
-      if (skus[i].text === label || skus[i].text.indexOf(label) !== -1) {
+      if (skus[i].text === label) {
         skus[i].el.click();
         return { clicked: true, text: skus[i].text, index: skus[i].index };
+      }
+    }
+    // 2. Label is a prefix or suffix of SKU text (e.g. "红" matches "红色")
+    for (var j = 0; j < skus.length; j++) {
+      if (skus[j].text.indexOf(label) === 0 || skus[j].text.lastIndexOf(label) === skus[j].text.length - label.length) {
+        skus[j].el.click();
+        return { clicked: true, text: skus[j].text, index: skus[j].index };
+      }
+    }
+    // 3. SKU text contains label (weakest match)
+    for (var k = 0; k < skus.length; k++) {
+      if (skus[k].text.indexOf(label) !== -1) {
+        skus[k].el.click();
+        return { clicked: true, text: skus[k].text, index: skus[k].index };
       }
     }
     return { clicked: false, reason: 'SKU label not found: ' + label };
   }
 
+  // [IMPROVED] Uses MutationObserver for price detection after last click
   async function clickSkuLabels(labels) {
     var results = [];
     for (var i = 0; i < labels.length; i++) {
       var r = clickSkuByLabel(labels[i]);
       results.push(r);
-      if (r.clicked) {
-        await new Promise(function(resolve) { setTimeout(resolve, 500); });
+      if (r.clicked && i < labels.length - 1) {
+        // Short wait between dimension clicks (UI update, not price)
+        await new Promise(function (resolve) { setTimeout(resolve, 300); });
       }
     }
-    // After clicking all labels, wait for price update
-    await new Promise(function(resolve) { setTimeout(resolve, 1500); });
-    var price = readCurrentPrice();
-    if (!price) {
-      await new Promise(function(resolve) { setTimeout(resolve, 800); });
-      price = readCurrentPrice();
-    }
+    // After last click: MutationObserver-based price wait
+    var oldPrice = readCurrentPrice();
+    var price = await waitForPriceChange(oldPrice, 3000);
     return { clicked: results, price: price };
   }
 
@@ -307,117 +516,194 @@
     return { clicked: true, text: sku.text, index: index, total: skus.length };
   }
 
-  function readCurrentPrice() {
-    // Phase 1: CSS selector patterns (broad coverage for CN e-commerce)
-    var sels = [
-      '.tm-promo-price .tm-price', '.tm-price', '.tb-rmb-num',
-      '[class*="PriceBox"] span', '[class*="Price"] span',
-      '.tb-price', 'span.price', 'strong.price', '.price-value',
-      '.mod-detail-price .value', '[class*="detail-price"]',
-      '[class*="priceValue"]', '[class*="price-value"]',
-      '[class*="currentPrice"]', '[class*="nowPrice"]',
-      '[class*="totalPrice"]', '[class*="salePrice"]',
-      '[class*="promoPrice"]', '[class*="promo-price"]',
-      '[class*="origPrice"]', '[class*="skuPrice"]',
-      '[class*="SalePrice"]', '[class*="NowPrice"]',
-    ];
-    for (var i = 0; i < sels.length; i++) {
-      var el = document.querySelector(sels[i]);
-      if (el) {
-        var t = (el.textContent || el.innerText || '').trim();
-        var m = t.match(/[¥￥]\s*(\d+\.?\d*)/);
-        if (m && m[1]) return '¥' + m[1];
-        m = t.match(/^(\d+\.?\d*)/);
-        if (m && m[1] && parseFloat(m[1]) > 0) return '¥' + m[1];
-      }
-    }
-
-    // Phase 2: Scan visible text for price patterns
-    var bodyText = (document.body.innerText || '');
-    var lines = bodyText.split('\n').slice(0, 60);
-    for (var j = 0; j < lines.length; j++) {
-      var pm = lines[j].match(/[¥￥]\s*(\d+\.?\d*)/);
-      if (pm) return '¥' + pm[1];
-    }
-
-    // Phase 3: Look for price-like numbers near ¥/￥ symbols anywhere
-    var allText = document.body.innerText || '';
-    var m2 = allText.match(/[¥￥]\s*(\d+\.?\d{2})/);
-    if (m2) return '¥' + m2[1];
-    m2 = allText.match(/¥(\d+)/);
-    if (m2) return '¥' + m2[1];
-
-    // Phase 4: Try data attributes
-    var dataPrice = document.querySelector('[data-price], [data-spm="price"]');
-    if (dataPrice) {
-      var val = dataPrice.getAttribute('data-price') || dataPrice.textContent;
-      var m3 = String(val).match(/(\d+\.?\d*)/);
-      if (m3) return '¥' + m3[1];
-    }
-
-    return '';
-  }
-
-  function collectAllImages(pathStr, includeAll) {
+  function collectAllImages(pathStr) {
     var node = getNodeAtPath(pathStr);
     if (!node) return { error: 'node_not_found', path: pathStr };
     var imgs = node.querySelectorAll('img');
     var urls = [];
     var seen = {};
-    for (var i = 0; i < imgs.length && urls.length < 30; i++) {
-      var img = imgs[i];
-      var src = '';
-      for (var ai = 0; ai < ATTRS.length; ai++) {
-        src = img.getAttribute(ATTRS[ai]);
-        if (src) break;
-      }
+    for (var i = 0; i < imgs.length && urls.length < 20; i++) {
+      var src = getImageSrc(imgs[i]); // [FIX] unified helper
       var u = normalizeUrl(src);
-      if (!u || seen[u]) continue;
-      if (!includeAll && !isProductImage(u)) continue;
-      var rect = img.getBoundingClientRect();
-      if (rect.width < 40 || rect.height < 40) continue;
+      if (!u || seen[u] || !isProductImage(u)) continue;
+      var rect = imgs[i].getBoundingClientRect();
+      if (rect.width < 50 || rect.height < 50) continue;
       seen[u] = true;
-      urls.push({ url: u, w: Math.round(rect.width), h: Math.round(rect.height), t: Math.round(rect.top + window.scrollY) });
-    }
-    // Also check background images in style attributes
-    if (urls.length === 0 || includeAll) {
-      var allEls = node.querySelectorAll('*');
-      for (var j = 0; j < allEls.length && urls.length < 30; j++) {
-        var bg = allEls[j].style.backgroundImage || '';
-        var bgm = bg.match(/url\(["']?([^"')]+)["']?\)/);
-        if (bgm) {
-          var bgu = normalizeUrl(bgm[1]);
-          if (bgu && !seen[bgu]) {
-            seen[bgu] = true;
-            urls.push({ url: bgu, w: 0, h: 0, t: 0, from: 'bg' });
-          }
-        }
-      }
+      urls.push({
+        url: u,
+        w: Math.round(rect.width),
+        h: Math.round(rect.height),
+        t: Math.round(rect.top) + Math.round(window.scrollY),
+      });
     }
     return { path: pathStr, images: urls };
   }
 
-  // Lazy-load image attributes to try, in priority order
-  var ATTRS = ['data-src', 'data-ks-lazyload', 'data-lazy-src', 'data-original', 'data-lazyload-src', 'src'];
-
   function listSkus() {
-    var all = findSkuElements();
-    var flat = all.map(function(s) { return { index: s.index, text: s.text, disabled: s.disabled }; });
+    var flat = findSkuElements().map(function (s) { return { index: s.index, text: s.text }; });
     var groups = findSkuGroups();
-    var state = findSkuState();
     return {
       flat: flat,
       groups: groups,
       total: flat.length,
-      available: state.available.length,
-      disabled: state.disabled.length,
-      is_compound: groups.length > 1
+      is_compound: groups.length > 1,
     };
   }
 
   // ═══════════════════════════════════════
-  // 4. AI Agent Loop — Conversational DOM Drilling
+  // 6. Local Fast Extractor (NEW — no AI)
   // ═══════════════════════════════════════
+
+  // Fast heuristic extraction: title, price, images, SKUs, description.
+  // Runs entirely in the content script with zero LLM calls.
+  function localFastExtract() {
+    var result = {
+      title_cn: '',
+      price_cn: '',
+      image_urls: [],
+      desc_images: [],
+      sku_prices: [],
+      description_cn: '',
+    };
+
+    // ── Title ──
+    var ogTitle = document.querySelector('meta[property="og:title"]');
+    if (ogTitle) {
+      result.title_cn = (ogTitle.getAttribute('content') || '').trim().slice(0, 200);
+    }
+    if (!result.title_cn) {
+      var h1El = document.querySelector('h1');
+      if (h1El) result.title_cn = (h1El.textContent || '').trim().slice(0, 200);
+    }
+    if (!result.title_cn) {
+      result.title_cn = document.title
+        .replace(/[\s\-|—]+(淘宝|天猫|1688|阿里巴巴|小红书|AliExpress|天猫超市|天猫国际|全球精选).*$/, '')
+        .trim().slice(0, 200);
+    }
+
+    // ── Price ──
+    result.price_cn = readCurrentPrice();
+
+    // ── Main images: largest images in upper half ──
+    var allImgs = document.querySelectorAll('img');
+    var imgCandidates = [];
+    var seenUrls = {};
+    for (var i = 0; i < allImgs.length; i++) {
+      var src = getImageSrc(allImgs[i]);
+      var u = normalizeUrl(src);
+      if (!u || !isProductImage(u) || seenUrls[u]) continue;
+      var rect = allImgs[i].getBoundingClientRect();
+      if (rect.width < 50 || rect.height < 50) continue;
+      seenUrls[u] = true;
+      var area = rect.width * rect.height;
+      var scrollY = Math.round(rect.top) + Math.round(window.scrollY);
+      var inUpperHalf = scrollY < document.body.scrollHeight * 0.4;
+      imgCandidates.push({ url: u, area: area, upper: inUpperHalf, top: scrollY });
+    }
+    imgCandidates.sort(function (a, b) {
+      if (a.upper !== b.upper) return a.upper ? -1 : 1;
+      return b.area - a.area;
+    });
+    for (var j = 0; j < imgCandidates.length && result.image_urls.length < 10; j++) {
+      result.image_urls.push(imgCandidates[j].url);
+    }
+
+    // ── Description images ──
+    var descMarkers = [
+      '图文详情', '产品详情', '商品详情', '宝贝详情', 'detailContent',
+      'descContent', 'mod-detail', 'J_Detail', 'description', 'detail',
+    ];
+    var descContainer = null;
+    var allSections = document.querySelectorAll('div, section');
+    for (var d = 0; d < allSections.length; d++) {
+      var cls = (allSections[d].className || '').toLowerCase();
+      var id = (allSections[d].id || '').toLowerCase();
+      for (var m = 0; m < descMarkers.length; m++) {
+        if (cls.indexOf(descMarkers[m].toLowerCase()) !== -1 ||
+            id.indexOf(descMarkers[m].toLowerCase()) !== -1) {
+          descContainer = allSections[d];
+          break;
+        }
+      }
+      if (descContainer) break;
+    }
+
+    if (descContainer) {
+      var descImgs = descContainer.querySelectorAll('img');
+      var descSeen = {};
+      for (var di = 0; di < descImgs.length && result.desc_images.length < 20; di++) {
+        var dsrc = getImageSrc(descImgs[di]);
+        var du = normalizeUrl(dsrc);
+        if (du && isProductImage(du) && !descSeen[du]) {
+          descSeen[du] = true;
+          result.desc_images.push(du);
+        }
+      }
+      result.description_cn = (descContainer.innerText || '').trim().slice(0, 5000);
+    }
+
+    return result;
+  }
+
+  // ═══════════════════════════════════════
+  // 7. Batch SKU Price Collection (NEW)
+  // ═══════════════════════════════════════
+
+  // Click ALL SKU variants and collect prices — no AI needed.
+  // For compound SKUs (color × size), generates all valid combinations.
+  async function batchCollectSkuPrices() {
+    var skuInfo = listSkus();
+    if (skuInfo.total === 0) return [];
+
+    var prices = [];
+
+    if (skuInfo.is_compound && skuInfo.groups.length > 1) {
+      var combos = generateCombinations(skuInfo.groups);
+      var limit = Math.min(combos.length, 50);
+      for (var c = 0; c < limit; c++) {
+        var labels = combos[c].map(function (item) { return item.text; });
+        var oldPrice = readCurrentPrice();
+        var clickResult = await clickSkuLabels(labels);
+        prices.push({
+          name: labels.join('/'),
+          price: clickResult.price || '',
+        });
+      }
+    } else {
+      var skus = findSkuElements();
+      var maxSkus = Math.min(skus.length, 30);
+      for (var s = 0; s < maxSkus; s++) {
+        var prevPrice = readCurrentPrice();
+        skus[s].el.click();
+        var newPrice = await waitForPriceChange(prevPrice, 3000);
+        prices.push({ name: skus[s].text, price: newPrice || '' });
+      }
+    }
+
+    return prices;
+  }
+
+  function generateCombinations(groups) {
+    if (groups.length === 0) return [];
+    if (groups.length === 1) {
+      return groups[0].options.map(function (opt) { return [opt]; });
+    }
+    var rest = generateCombinations(groups.slice(1));
+    var result = [];
+    for (var i = 0; i < groups[0].options.length; i++) {
+      for (var j = 0; j < rest.length; j++) {
+        result.push([groups[0].options[i]].concat(rest[j]));
+      }
+    }
+    return result;
+  }
+
+  // ═══════════════════════════════════════
+  // 8. AI Agent Loop — Hybrid Approach
+  // ═══════════════════════════════════════
+  //
+  // Phase A: Local fast extract + batch SKU collection (no AI)
+  // Phase B: If completeness < 70%, fall back to conversational DOM drilling
 
   async function aiExtract(apiUrl, debug) {
     var platform = detectPlatform();
@@ -425,11 +711,55 @@
       return { error: 'unsupported_platform', url: window.location.href };
     }
 
+    // ══ Phase A: Local Fast Extract (<500ms) ══
+    var localData = localFastExtract();
+
+    // ══ Phase A2: Batch SKU Price Collection ══
+    try {
+      var skuPrices = await batchCollectSkuPrices();
+      localData.sku_prices = skuPrices;
+    } catch (e) {
+      // Non-fatal: SKU collection failure shouldn't block extraction
+      if (debug) console.log('[Agent] SKU batch collection failed:', e.message);
+    }
+
+    // ══ Completeness Score ══
+    var score = 0;
+    if (localData.title_cn) score += 25;
+    if (localData.price_cn) score += 25;
+    if (localData.image_urls.length >= 2) score += 25;
+    if (localData.desc_images.length >= 1 || localData.description_cn) score += 15;
+    if (localData.sku_prices.length >= 1) score += 10;
+
+    // If local extraction is sufficient, skip AI loop entirely
+    if (score >= 70) {
+      if (debug) {
+        console.log('[Agent] Local extraction sufficient (score=' + score + '), skipping AI loop');
+      }
+      return buildResult(localData, platform, [{
+        step: 'local',
+        score: score,
+        note: 'No AI rounds needed',
+      }]);
+    }
+
+    // ══ Phase B: AI Agent Fallback (conversational DOM drilling) ══
+    if (debug) {
+      console.log('[Agent] Local score=' + score + '/100, falling back to AI DOM drilling');
+    }
+
     var maxRounds = 8;
     var debugLog = [];
     var history = [];
     var exploredPaths = {};
     var collectedData = {};
+
+    // Seed with local data so AI only needs to fill gaps
+    for (var lk in localData) {
+      if (localData.hasOwnProperty(lk) && localData[lk]) {
+        collectedData[lk] = localData[lk];
+      }
+    }
 
     var initialSnapshot = buildInitialSnapshot();
     exploredPaths['root'] = initialSnapshot.top_level;
@@ -445,7 +775,7 @@
         explored: exploredPaths,
         collected: collectedData,
         history: history.slice(-10),
-        skus_available: listSkus()
+        skus_available: listSkus(),
       };
 
       if (debug) {
@@ -497,27 +827,19 @@
             case 'click_sku':
               result = clickSkuByIndex(action.index !== undefined ? action.index : 0);
               if (result.clicked) {
-                await new Promise(function(r) { setTimeout(r, 1500); });
-                var price = readCurrentPrice();
-                if (!price) {
-                  await new Promise(function(r) { setTimeout(r, 800); });
-                  price = readCurrentPrice();
-                }
-                result.price_after_click = price;
+                var prevPrice = readCurrentPrice();
+                var newPrice = await waitForPriceChange(prevPrice, 3000);
+                result.price_after_click = newPrice;
                 if (!collectedData.sku_prices) collectedData.sku_prices = [];
-                collectedData.sku_prices.push({ name: result.text, price: price });
+                collectedData.sku_prices.push({ name: result.text, price: newPrice });
               }
               break;
 
             case 'click_sku_label':
               result = clickSkuByLabel(action.label || '');
               if (result.clicked) {
-                await new Promise(function(r) { setTimeout(r, 1500); });
-                var lblPrice = readCurrentPrice();
-                if (!lblPrice) {
-                  await new Promise(function(r) { setTimeout(r, 800); });
-                  lblPrice = readCurrentPrice();
-                }
+                var prevLblPrice = readCurrentPrice();
+                var lblPrice = await waitForPriceChange(prevLblPrice, 3000);
                 result.price_after_click = lblPrice;
                 if (!collectedData.sku_prices) collectedData.sku_prices = [];
                 collectedData.sku_prices.push({ name: result.text, price: lblPrice });
@@ -531,12 +853,6 @@
                 if (!collectedData.sku_prices) collectedData.sku_prices = [];
                 collectedData.sku_prices.push({ name: comboName, price: result.price });
               }
-              // Report SKU state after combo click
-              result._sku_state = findSkuState();
-              break;
-
-            case 'check_sku_state':
-              result = findSkuState();
               break;
 
             case 'read_price':
@@ -547,31 +863,45 @@
               break;
 
             case 'collect_images':
-              var isDesc = (action.category === 'desc_images');
-              result = collectAllImages(action.path || 'root', isDesc);
+              result = collectAllImages(action.path || 'root');
               if (!result.error) {
-                var key = action.category || 'image_urls';
-                if (!collectedData[key]) collectedData[key] = [];
-                var newUrls = result.images.map(function(img) { return img.url; });
-                collectedData[key] = collectedData[key].concat(newUrls);
+                var imgKey = action.category || 'image_urls';
+                if (!collectedData[imgKey]) collectedData[imgKey] = [];
+                var newUrls = result.images.map(function (img) { return img.url; });
+                collectedData[imgKey] = collectedData[imgKey].concat(newUrls);
               }
               break;
 
             case 'extract':
               if (action.data && Object.keys(action.data).length > 0) {
-                for (var k in action.data) {
-                  if (action.data.hasOwnProperty(k)) {
-                    collectedData[k] = action.data[k];
+                // [FIX] Whitelist: only allow known field names
+                var allowedFields = [
+                  'title_cn', 'price_cn', 'description_cn',
+                  'image_urls', 'desc_images', 'sku_prices',
+                ];
+                var stored = [];
+                for (var ek in action.data) {
+                  if (action.data.hasOwnProperty(ek) && allowedFields.indexOf(ek) !== -1) {
+                    collectedData[ek] = action.data[ek];
+                    stored.push(ek);
                   }
                 }
-                result = { stored: Object.keys(action.data) };
+                result = stored.length
+                  ? { stored: stored }
+                  : { error: 'No valid fields in extract action. Allowed: ' + allowedFields.join(', ') };
               } else {
-                result = { error: 'extract requires "data" object with fields to store (e.g. {"type":"extract","data":{"title_cn":"..."}}). Valid types: expand_dom, click_sku, read_price, collect_images, extract' };
+                result = {
+                  error: 'extract requires "data" object with fields to store. ' +
+                    'Valid types: expand_dom, click_sku, click_sku_label, click_sku_combo, read_price, collect_images, extract',
+                };
               }
               break;
 
             default:
-              result = { error: 'INVALID action type: "' + action.type + '". ONLY these 5 types are valid: expand_dom, click_sku, read_price, collect_images, extract. Use expand_dom to explore the DOM.' };
+              result = {
+                error: 'INVALID action type: "' + action.type + '". ' +
+                  'ONLY these types are valid: expand_dom, click_sku, click_sku_label, click_sku_combo, read_price, collect_images, extract',
+              };
           }
         } catch (e) {
           result = { error: e.message };
@@ -579,7 +909,12 @@
 
         stepEntry.actions.push(action);
         stepEntry.results.push(result);
-        history.push({ round: round, action: action.type, path: action.path, result_summary: summarizeResult(result) });
+        history.push({
+          round: round,
+          action: action.type,
+          path: action.path,
+          result_summary: summarizeResult(result),
+        });
       }
 
       debugLog.push(stepEntry);
@@ -592,8 +927,9 @@
     if (!result) return 'null';
     if (result.error) return 'error: ' + result.error;
     if (result.children) return result.children.length + ' children';
-    if (result.available !== undefined) return 'sku_state: ' + result.available.length + ' available, ' + (result.disabled ? result.disabled.length : 0) + ' disabled';
-    if (result.clicked && Array.isArray(result.clicked)) return 'combo: ' + result.clicked.map(function(r) { return r.text; }).join('+') + ' price=' + (result.price || '?');
+    if (result.clicked && Array.isArray(result.clicked)) {
+      return 'combo: ' + result.clicked.map(function (r) { return r.text; }).join('+') + ' price=' + (result.price || '?');
+    }
     if (result.clicked) return 'clicked: ' + result.text + ' price=' + (result.price_after_click || result.price || '?');
     if (result.price) return 'price=' + result.price;
     if (result.images) return result.images.length + ' images';
@@ -602,10 +938,16 @@
   }
 
   function buildResult(data, platform, debugLog) {
+    var h1El = document.querySelector('h1');
+    var h1Text = h1El ? (h1El.textContent || '').trim().slice(0, 200) : '';
+    var fallbackTitle = document.title
+      .replace(/[\s\-|—]+(淘宝|天猫|1688|阿里巴巴|小红书|AliExpress).*$/, '')
+      .trim();
+
     var result = {
       url: window.location.href,
       platform: platform,
-      title_cn: data.title_cn || document.querySelector('h1')?.textContent?.trim()?.slice(0, 200) || document.title.replace(/[\s-]+(淘宝|天猫|1688).*$/, '').trim(),
+      title_cn: data.title_cn || h1Text || fallbackTitle,
       price_cn: data.price_cn || readCurrentPrice() || '',
       image_urls: data.image_urls || [],
       desc_images: data.desc_images || [],
@@ -617,16 +959,36 @@
   }
 
   // ═══════════════════════════════════════
-  // 5. Message Listener
+  // 9. Message Listener
   // ═══════════════════════════════════════
 
-  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // [NEW] URL validation: only allow localhost
+  function isValidApiUrl(url) {
+    if (!url || typeof url !== 'string') return false;
+    try {
+      var parsed = new URL(url);
+      return (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1')
+        && (parsed.protocol === 'http:' || parsed.protocol === 'https:');
+    } catch (e) {
+      return false;
+    }
+  }
+
+  chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
     if (msg.action === 'extract') {
-      var apiUrl = msg.apiUrl || 'http://localhost:8765';
+      var apiUrl = 'http://localhost:8765';
+      if (msg.apiUrl && isValidApiUrl(msg.apiUrl)) {
+        apiUrl = msg.apiUrl;
+      }
       var debug = !!msg.debug;
-      aiExtract(apiUrl, debug).then(function (data) {
-        sendResponse(data);
-      });
+
+      aiExtract(apiUrl, debug)
+        .then(function (data) {
+          sendResponse(data);
+        })
+        .catch(function (err) {
+          sendResponse({ error: err.message || 'Unknown extraction error', url: window.location.href });
+        });
       return true;
     }
 
