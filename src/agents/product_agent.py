@@ -195,8 +195,7 @@ class ProductAgent:
             print(f"  [AI] Extraction failed ({ai_result['_error']}), using layout fallback...")
             ai_result = await self._layout_fallback_extraction(page)
 
-        # ── Phase 3: Scroll to trigger lazy-load, then collect layout images ──
-        await self._scroll_page(page)
+        # ── Phase 3: Collect layout images ──
         layout = await extractor.collect_layout_images(page)
 
         # ── Phase 4: Merge + filter results ──
@@ -279,19 +278,6 @@ class ProductAgent:
         except Exception:
             result["description_cn"] = ""
         return result
-
-    async def _scroll_page(self, page) -> None:
-        """Scroll down to trigger lazy-loaded images."""
-        try:
-            sh = await page.evaluate("() => document.body.scrollHeight")
-            if isinstance(sh, str):
-                sh = int(sh) if sh.isdigit() else 10000
-            for y in range(0, max(sh, 5000), 800):
-                await page.evaluate(f"() => {{ window.scrollTo(0, {y}) }}")
-                await asyncio.sleep(0.3)
-            await asyncio.sleep(3)
-        except Exception as exc:
-            logger.warning(f"Scroll failed: {exc}")
 
     def _merge_results(self, ai: dict, layout: dict) -> dict[str, Any]:
         """Merge AI extraction with layout-based image collection, deduplicate + filter."""
@@ -427,9 +413,6 @@ class ProductAgent:
                 if ai_result.get("_error"):
                     print(f"  [AI] Extraction failed ({ai_result['_error']}), using layout fallback...")
                     ai_result = await self._layout_fallback_extraction(page)
-
-                # Scroll for lazy-load
-                await self._scroll_page(page)
 
                 # Layout image collection
                 layout = await extractor.collect_layout_images(page)

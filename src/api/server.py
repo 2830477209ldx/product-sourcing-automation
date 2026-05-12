@@ -99,22 +99,49 @@ async def health():
 class AgentStepRequest(BaseModel):
     platform: str = ""
     round: int = 0
-    dom: dict = {}
+    max_rounds: int = 8
+    initial: dict = {}
+    explored: dict = {}
+    collected: dict = {}
     history: list[dict] = []
+    skus_available: dict = {}
     debug: bool = False
 
 
 @app.post("/api/ai-agent/step")
 async def ai_agent_step(req: AgentStepRequest):
     llm = _get_llm()
+    dom_state = {
+        "initial": req.initial,
+        "explored": req.explored,
+        "collected": req.collected,
+        "skus_available": req.skus_available,
+    }
+    logger.info(
+        f"[Step {req.round}] received: platform={req.platform} | "
+        f"explored_paths={list(req.explored.keys())} | "
+        f"explored_keys={list(req.explored.get(list(req.explored.keys())[0], {}).keys()) if req.explored else 'EMPTY'} | "
+        f"explored_child_count={len(req.explored.get(list(req.explored.keys())[0], {}).get('children', [])) if req.explored else 'N/A'} | "
+        f"collected_keys={list(req.collected.keys())} | "
+        f"skus_total={req.skus_available.get('total', 0)} | " +
+        f"skus_compound={req.skus_available.get('is_compound', False)} | "
+        f"history_len={len(req.history)}"
+    )
     result = await agent_step(
         llm=llm,
         platform=req.platform or "unknown",
         round_num=req.round,
-        dom_state=req.dom,
+        dom_state=dom_state,
         history=req.history,
+        max_rounds=req.max_rounds,
         debug=req.debug,
     )
+    if result.get("actions"):
+        action_types = [a.get("type", "?") for a in result.get("actions", [])]
+        logger.info(f"[Step {req.round}] AI returned actions: {action_types}")
+        invalid = [t for t in action_types if t not in ("expand_dom", "click_sku", "read_price", "collect_images", "extract")]
+        if invalid:
+            logger.warning(f"[Step {req.round}] INVALID action types detected: {invalid}")
     return result
 
 
